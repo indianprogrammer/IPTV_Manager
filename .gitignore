@@ -1,0 +1,11 @@
+/data/iptv.sqlite
+/data/iptv.sqlite-shm
+/data/iptv.sqlite-wal
+/data/cache/
+/data/*.pid
+/data/*.log
+
+.DS_Store
+*.swp
+*~
+__pycache__/

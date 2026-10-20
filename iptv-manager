@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -u
+
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DATA_DIR="$PROJECT_DIR/data"
+WEB_PID_FILE="$DATA_DIR/web-server.pid"
+PLAYLIST_PID_FILE="$DATA_DIR/playlist-server.pid"
+WEB_LOG_FILE="$DATA_DIR/web-server.log"
+PLAYLIST_LOG_FILE="$DATA_DIR/playlist-server.log"
+HOST=${IPTV_HOST:-127.0.0.1}
+WEB_PORT=${IPTV_PORT:-8000}
+PLAYLIST_PORT=${IPTV_PLAYLIST_PORT:-8001}
+PHP_BIN=${PHP_BIN:-$(command -v php || true)}
+
+usage() {
+    echo "Usage: $0 {start|stop|restart|status}" >&2
+    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT (override with IPTV_PORT and IPTV_PLAYLIST_PORT)" >&2
+}
+
+read_pid() {
+    local pid_file=$1
+    if [ -f "$pid_file" ]; then
+        IFS= read -r SERVER_PID < "$pid_file" || true
+        case ${SERVER_PID:-} in
+            ''|*[!0-9]*) SERVER_PID= ;;
+        esac
+    else
+        SERVER_PID=
+    fi
+}
+
+is_our_server() {
+    local pid=$1 port=$2
+    local -a process_args=()
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    mapfile -d '' -t process_args < "/proc/$pid/cmdline"
+    [ "${process_args[0]:-}" = "$PHP_BIN" ] \
+        && [ "${process_args[1]:-}" = '-S' ] \
+        && [ "${process_args[2]:-}" = "$HOST:$port" ] \
+        && [ "${process_args[3]:-}" = '-t' ] \
+        && [ "${process_args[4]:-}" = "$PROJECT_DIR" ] \
+        && { [ "${process_args[5]:-}" = "$PROJECT_DIR/router.php" ] || [ "${#process_args[@]}" -eq 5 ]; }
+}
+
+find_project_server() {
+    local port=$1 proc_dir pid
+    for proc_dir in /proc/[0-9]*; do
+        pid=${proc_dir##*/}
+        if is_our_server "$pid" "$port"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+running_pid() {
+    local pid_file=$1 port=$2
+    read_pid "$pid_file"
+    [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null && is_our_server "$SERVER_PID" "$port"
+}
+
+start_server() {
+    local name=$1 port=$2 pid_file=$3 log_file=$4
+    if running_pid "$pid_file" "$port"; then
+        echo "$name server already running (PID $SERVER_PID) at http://$HOST:$port"
+        return 0
+    fi
+
+    read_pid "$pid_file"
+    if [ -n "${SERVER_PID:-}" ]; then
+        echo "Removing stale or mismatched PID file: $pid_file"
+        rm -f "$pid_file"
+    fi
+
+    local existing_pid
+    existing_pid=$(find_project_server "$port" || true)
+    if [ -n "$existing_pid" ]; then
+        local -a existing_args=()
+        mapfile -d '' -t existing_args < "/proc/$existing_pid/cmdline"
+        if [ "${existing_args[5]:-}" = "$PROJECT_DIR/router.php" ]; then
+            printf '%s\n' "$existing_pid" > "$pid_file"
+            echo "$name server already running (PID $existing_pid) at http://$HOST:$port"
+            return 0
+        fi
+
+        echo "Stopping unmanaged legacy $name server (PID $existing_pid) before starting the secured server."
+        kill -TERM "$existing_pid" || {
+            echo "Error: could not stop legacy server PID $existing_pid." >&2
+            return 1
+        }
+        for _ in {1..50}; do
+            if ! kill -0 "$existing_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            echo "Error: legacy server PID $existing_pid did not stop in time." >&2
+            return 1
+        fi
+    fi
+
+    nohup "$PHP_BIN" -S "$HOST:$port" -t "$PROJECT_DIR" "$PROJECT_DIR/router.php" >>"$log_file" 2>&1 </dev/null &
+    SERVER_PID=$!
+    printf '%s\n' "$SERVER_PID" > "$pid_file"
+
+    for _ in {1..30}; do
+        if is_our_server "$SERVER_PID" "$port" && kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "Started $name server (PID $SERVER_PID) at http://$HOST:$port"
+            return 0
+        fi
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    rm -f "$pid_file"
+    echo "Error: $name server failed to start. Recent log output:" >&2
+    tail -n 5 "$log_file" >&2 || true
+    return 1
+}
+
+stop_server() {
+    local name=$1 port=$2 pid_file=$3
+    read_pid "$pid_file"
+    if [ -z "${SERVER_PID:-}" ]; then
+        echo "$name server stopped (no valid PID file)."
+        return 0
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null || ! is_our_server "$SERVER_PID" "$port"; then
+        rm -f "$pid_file"
+        echo "$name server stopped (removed stale PID file)."
+        return 0
+    fi
+
+    kill -TERM "$SERVER_PID" || {
+        echo "Error: could not stop server PID $SERVER_PID." >&2
+        return 1
+    }
+    for _ in {1..50}; do
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            rm -f "$pid_file"
+            echo "Stopped $name server."
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    echo "Error: $name server PID $SERVER_PID did not stop in time." >&2
+    return 1
+}
+
+status_server() {
+    local name=$1 port=$2 pid_file=$3
+    if running_pid "$pid_file" "$port"; then
+        echo "$name server running (PID $SERVER_PID) at http://$HOST:$port"
+        return 0
+    fi
+    echo "$name server stopped."
+    return 3
+}
+
+start_all() {
+    if [ -z "$PHP_BIN" ]; then
+        echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
+        return 1
+    fi
+    if ! "$PHP_BIN" -m 2>/dev/null | grep -qi '^pdo_sqlite$'; then
+        echo "Error: PHP must have the PDO SQLite extension enabled." >&2
+        return 1
+    fi
+    if [ "$WEB_PORT" = "$PLAYLIST_PORT" ]; then
+        echo "Error: web and playlist ports must be different." >&2
+        return 1
+    fi
+    mkdir -p "$DATA_DIR" || {
+        echo "Error: could not create $DATA_DIR" >&2
+        return 1
+    }
+
+    start_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE" "$WEB_LOG_FILE" || return 1
+    if ! start_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE" "$PLAYLIST_LOG_FILE"; then
+        stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
+        return 1
+    fi
+}
+
+case ${1:-} in
+    start) start_all ;;
+    stop)
+        stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
+        playlist_status=$?
+        stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
+        web_status=$?
+        [ "$playlist_status" -eq 0 ] && [ "$web_status" -eq 0 ]
+        ;;
+    restart)
+        stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE" || exit $?
+        stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE" || exit $?
+        start_all
+        ;;
+    status)
+        status_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
+        web_status=$?
+        status_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
+        playlist_status=$?
+        if [ "$web_status" -eq 0 ] && [ "$playlist_status" -eq 0 ]; then
+            exit 0
+        elif [ "$web_status" -eq 3 ] && [ "$playlist_status" -eq 3 ]; then
+            exit 3
+        else
+            exit 1
+        fi
+        ;;
+    *) usage; exit 2 ;;
+esac
