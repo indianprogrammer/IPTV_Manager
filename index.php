@@ -653,6 +653,7 @@ function statusButton(int $id, bool $enabled): string
         <div class="topbar-right">
             <span class="admin-label"><span class="online-dot"></span><?= h((string) $_SESSION['admin']) ?></span>
             <a class="button text-button" href="index.php?guide=1"<?= $guideMode ? ' aria-current="page"' : '' ?>>TV Guide</a>
+            <a class="button text-button" href="index.php?add=1"<?= $addChannel ? ' aria-current="page"' : '' ?>>Add channel</a>
             <a class="button text-button categories-link" href="index.php?categories=1"<?= $manageCategories ? ' aria-current="page"' : '' ?>>Manage categories</a>
             <a class="button text-button" href="<?= h($playlistUrl) ?>" download="iptv-manager.m3u">Download M3U</a>
             <form method="post" class="purge-cache-form">
@@ -944,8 +945,6 @@ function statusButton(int $id, bool $enabled): string
                     </select>
                     <button class="button secondary" type="submit">Filter</button>
                     <?php if ($search !== '' || $category !== ''): ?><a class="clear-link" href="index.php">Clear</a><?php endif; ?>
-                    <a class="button primary" href="index.php?add=1">Add channel</a>
-                    <a class="button secondary" href="index.php?categories=1">Manage categories</a>
                 </form>
             </div>
             <div class="table-wrap">
