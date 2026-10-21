@@ -2,6 +2,14 @@
 # Shared helpers to find a PHP CLI binary that has the PDO SQLite extension.
 # Sourced by iptv-manager and iptv-manager-service.
 
+# Runtime limits applied to the built-in PHP server so large channel exports
+# (and the M3U imports) can be uploaded and decoded without touching php.ini.
+PHP_RUNTIME_OPTIONS=(
+    -d upload_max_filesize=64M
+    -d post_max_size=64M
+    -d memory_limit=512M
+)
+
 php_has_pdo_sqlite() {
     local candidate=${1:-}
     [ -n "$candidate" ] || return 1

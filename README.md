@@ -20,6 +20,14 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 - Inline SVG icon actions for play, edit, and delete
 - Category management: rename to merge, delete empty categories
 
+**Channel export / import (JSON backup)**
+- **Export channels** downloads a JSON snapshot of the whole library — every channel with its feeds, logo, category, language, properties, feed visibility and DRM settings
+- Filters: all channels, enabled only, disabled only, or a single category; DRM keys and license URLs can be left out
+- **Import channel export** restores such a file: *merge* adds and updates the channels it contains, *replace* deletes every channel first and restores the file exactly (with an explicit confirmation)
+- Channels are matched by their export id first and by name second, so importing the same file twice never creates duplicates
+- The file is plain JSON (`format: iptv-manager-channels`) and can be edited or filtered before it is imported again
+- The TV guide is not part of the export — it is imported separately from the XMLTV source
+
 **Playlist feed**
 - Cached M3U feed served on its own port; only enabled channels and feeds are included
 - Each feed chooses where it appears: playlist server, clear server, or both
@@ -119,13 +127,32 @@ You can also run the servers directly:
 
 ```sh
 set -a; . ./.env; set +a
-php -S "$IPTV_HOST:$IPTV_PORT" -t . router.php
-php -S "$IPTV_HOST:$IPTV_PLAYLIST_PORT" -t . router.php
-php -S "$IPTV_HOST:$IPTV_CLEAR_PORT" -t . router.php
-php -S "$IPTV_HOST:$IPTV_AUTO_PORT" -t . router.php
+php -d upload_max_filesize=64M -d post_max_size=64M -d memory_limit=512M -S "$IPTV_HOST:$IPTV_PORT" -t . router.php
+php -d upload_max_filesize=64M -d post_max_size=64M -d memory_limit=512M -S "$IPTV_HOST:$IPTV_PLAYLIST_PORT" -t . router.php
+php -d upload_max_filesize=64M -d post_max_size=64M -d memory_limit=512M -S "$IPTV_HOST:$IPTV_CLEAR_PORT" -t . router.php
+php -d upload_max_filesize=64M -d post_max_size=64M -d memory_limit=512M -S "$IPTV_HOST:$IPTV_AUTO_PORT" -t . router.php
 ```
 
 To have them start automatically on boot, install them as a [system service](#system-service).
+
+### Channel export and import
+
+The web UI can export the whole channel library as a JSON file and import it back — handy for backups and for moving a library to another server.
+
+- **Export channels** (top navigation) → pick *all / enabled / disabled* channels, optionally restrict it to one category, and optionally leave the DRM keys out → **Download JSON export** saves `iptv-manager-channels-YYYY-MM-DD.json`.
+- **Import playlist** → *Import channel export* uploads that file again:
+  - **Merge with the current library** — channels in the file are added or updated, everything else stays untouched.
+  - **Replace every channel** — every channel is deleted first and the file becomes the new library (the checkbox confirmation is required).
+- Channels are matched by the `source_id` written in the export, then by name, so the same file can be imported twice without duplicating channels.
+- The file format is documented by itself (`format: "iptv-manager-channels"`, `version: 1`) and can be edited with any text editor before it is imported again.
+
+The export is served directly by the web server, so it also works with `curl` once you are signed in:
+
+```sh
+curl -b cookies.txt "http://127.0.0.1:8000/index.php?export=channels&scope=all&category=News&drm=1" -o channels.json
+```
+
+The uploaded file must stay below the PHP upload limit; the launcher starts the servers with `upload_max_filesize=64M` and `post_max_size=64M` so even a library of tens of thousands of channels can be restored.
 
 ### Configuration
 
@@ -255,7 +282,7 @@ Everything lives in a single SQLite file at `data/iptv.sqlite`. On first run the
 
 ```
 index.php        Web UI: routes, actions, views, preview player
-lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers, live log, UA security, .env loader
+lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers, live log, UA security, JSON channel export/import, .env loader
 playlist.php     Cached M3U endpoint (ETag / 304), reused for the full and clear feeds
 playlist-clear.php Clear-server M3U endpoint (feeds assigned to clear or both)
 playlist-auto.php  Auto-server M3U endpoint — the user-agent rule picks full or clear

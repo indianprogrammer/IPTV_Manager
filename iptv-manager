@@ -77,14 +77,35 @@ read_pid() {
 is_our_server() {
     local pid=$1 port=$2
     local -a process_args=()
+    local arg has_host=0 has_router=0
     [ -r "/proc/$pid/cmdline" ] || return 1
     mapfile -d '' -t process_args < "/proc/$pid/cmdline"
-    [ "${process_args[0]:-}" = "$PHP_BIN" ] \
-        && [ "${process_args[1]:-}" = '-S' ] \
-        && [ "${process_args[2]:-}" = "$HOST:$port" ] \
-        && [ "${process_args[3]:-}" = '-t' ] \
-        && [ "${process_args[4]:-}" = "$PROJECT_DIR" ] \
-        && { [ "${process_args[5]:-}" = "$PROJECT_DIR/router.php" ] || [ "${#process_args[@]}" -eq 5 ]; }
+    [ "${#process_args[@]}" -ge 3 ] || return 1
+    [ "${process_args[0]}" = "$PHP_BIN" ] || return 1
+    for arg in "${process_args[@]:1}"; do
+        case "$arg" in
+            "$HOST:$port") has_host=1 ;;
+            "$PROJECT_DIR/router.php") has_router=1 ;;
+        esac
+    done
+    [ "$has_host" -eq 1 ] || return 1
+    if [ "$has_router" -eq 1 ]; then
+        return 0
+    fi
+
+    [ "${#process_args[@]}" -eq 5 ]
+}
+
+uses_router_script() {
+    local pid=$1
+    local -a process_args=()
+    local arg
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    mapfile -d '' -t process_args < "/proc/$pid/cmdline"
+    for arg in "${process_args[@]:1}"; do
+        [ "$arg" = "$PROJECT_DIR/router.php" ] && return 0
+    done
+    return 1
 }
 
 find_project_server() {
@@ -121,9 +142,7 @@ start_server() {
     local existing_pid
     existing_pid=$(find_project_server "$port" || true)
     if [ -n "$existing_pid" ]; then
-        local -a existing_args=()
-        mapfile -d '' -t existing_args < "/proc/$existing_pid/cmdline"
-        if [ "${existing_args[5]:-}" = "$PROJECT_DIR/router.php" ]; then
+        if uses_router_script "$existing_pid"; then
             printf '%s\n' "$existing_pid" > "$pid_file"
             echo "$name server already running (PID $existing_pid) at http://$HOST:$port"
             return 0
@@ -146,7 +165,7 @@ start_server() {
         fi
     fi
 
-    nohup "$PHP_BIN" -S "$HOST:$port" -t "$PROJECT_DIR" "$PROJECT_DIR/router.php" >>"$log_file" 2>&1 </dev/null &
+    nohup "$PHP_BIN" "${PHP_RUNTIME_OPTIONS[@]}" -S "$HOST:$port" -t "$PROJECT_DIR" "$PROJECT_DIR/router.php" >>"$log_file" 2>&1 </dev/null &
     SERVER_PID=$!
     printf '%s\n' "$SERVER_PID" > "$pid_file"
 

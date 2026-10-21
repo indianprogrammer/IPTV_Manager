@@ -1101,6 +1101,313 @@ function importPlaylist(PDO $db, string $content): array
     return ['added' => $added, 'updated' => $updated, 'skipped' => $skipped, 'total' => count($entries)];
 }
 
+function exportChannelData(PDO $db, array $options = []): array
+{
+    $scope = (string) ($options['scope'] ?? 'all');
+    $category = trim((string) ($options['category'] ?? ''));
+    $includeDrm = !array_key_exists('include_drm', $options) || (bool) $options['include_drm'];
+
+    $where = [];
+    $parameters = [];
+    if ($scope === 'enabled') {
+        $where[] = 'c.enabled = 1';
+    } elseif ($scope === 'disabled') {
+        $where[] = 'c.enabled = 0';
+    }
+    if ($category !== '') {
+        $where[] = 'c.group_title = :category';
+        $parameters[':category'] = $category;
+    }
+
+    $statement = $db->prepare(
+        'SELECT c.* FROM channels c'
+        . ($where !== [] ? ' WHERE ' . implode(' AND ', $where) : '')
+        . ' ORDER BY c.group_title COLLATE NOCASE, c.name COLLATE NOCASE, c.id'
+    );
+    $statement->execute($parameters);
+    $channels = $statement->fetchAll();
+
+    $feedsByChannel = [];
+    if ($channels !== []) {
+        $ids = array_map(static fn (array $channel): int => (int) $channel['id'], $channels);
+        foreach (array_chunk($ids, 500) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+            $feedStatement = $db->prepare(
+                "SELECT * FROM feeds WHERE channel_id IN ($placeholders) ORDER BY channel_id, sort_order, id"
+            );
+            $feedStatement->execute($chunk);
+            foreach ($feedStatement->fetchAll() as $feed) {
+                $feedsByChannel[(int) $feed['channel_id']][] = $feed;
+            }
+        }
+    }
+
+    $exported = [];
+    foreach ($channels as $channel) {
+        $entry = [
+            'source_id' => (string) $channel['source_id'],
+            'name' => (string) $channel['name'],
+            'tvg_id' => (string) $channel['tvg_id'],
+            'tvg_name' => (string) $channel['tvg_name'],
+            'tvg_language' => (string) $channel['tvg_language'],
+            'tvg_type' => (string) $channel['tvg_type'],
+            'group_title' => (string) $channel['group_title'],
+            'logo_url' => (string) $channel['logo_url'],
+            'enabled' => (int) $channel['enabled'] === 1,
+            'attributes' => json_decode((string) $channel['attributes_json']) ?: (object) [],
+            'properties' => json_decode((string) $channel['properties_json']) ?: (object) [],
+            'url_fields' => json_decode((string) $channel['url_fields_json']) ?: (object) [],
+            'feeds' => [],
+        ];
+        if ($includeDrm) {
+            $entry['drm_type'] = (string) $channel['drm_type'];
+            $entry['drm_key_id'] = (string) $channel['drm_key_id'];
+            $entry['drm_key'] = (string) $channel['drm_key'];
+            $entry['drm_headers'] = (string) $channel['drm_headers'];
+        }
+        foreach ($feedsByChannel[(int) $channel['id']] ?? [] as $feed) {
+            $feedEntry = [
+                'label' => (string) $feed['label'],
+                'stream_url' => (string) $feed['stream_url'],
+                'license_key_url' => (string) $feed['license_key_url'],
+                'visibility' => (string) $feed['visibility'],
+                'enabled' => (int) $feed['enabled'] === 1,
+                'sort_order' => (int) $feed['sort_order'],
+                'properties' => json_decode((string) $feed['properties_json']) ?: (object) [],
+            ];
+            if ($includeDrm) {
+                $feedEntry['drm_type'] = (string) $feed['drm_type'];
+                $feedEntry['drm_key_id'] = (string) $feed['drm_key_id'];
+                $feedEntry['drm_key'] = (string) $feed['drm_key'];
+                $feedEntry['drm_headers'] = (string) $feed['drm_headers'];
+            }
+            $entry['feeds'][] = $feedEntry;
+        }
+        $exported[] = $entry;
+    }
+
+    return [
+        'format' => 'iptv-manager-channels',
+        'version' => 1,
+        'exported_at' => gmdate('c'),
+        'scope' => $scope,
+        'category' => $category,
+        'includes_drm' => $includeDrm,
+        'channel_count' => count($exported),
+        'channels' => $exported,
+    ];
+}
+
+function exportChannelJson(PDO $db, array $options = []): string
+{
+    $payload = exportChannelData($db, $options);
+    $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($json === false) {
+        throw new RuntimeException('Unable to encode the channel export.');
+    }
+    return $json;
+}
+
+function importChannelData(PDO $db, array $payload, string $mode = 'merge'): array
+{
+    if ((string) ($payload['format'] ?? '') !== 'iptv-manager-channels') {
+        throw new RuntimeException('This file is not an IPTV Manager channel export.');
+    }
+    $channels = $payload['channels'] ?? null;
+    if (!is_array($channels) || $channels === []) {
+        throw new RuntimeException('The export file contains no channels.');
+    }
+    $replace = $mode === 'replace';
+
+    $findChannelBySourceId = $db->prepare('SELECT id FROM channels WHERE source_id = :source_id');
+    $findChannelByName = $db->prepare('SELECT id FROM channels WHERE name = :name ORDER BY id LIMIT 1');
+    $insertChannel = $db->prepare(
+        'INSERT INTO channels (source_id, name, tvg_id, tvg_name, tvg_language, tvg_type, group_title, '
+        . 'logo_url, stream_url, license_key_url, attributes_json, properties_json, url_fields_json, enabled, '
+        . 'drm_type, drm_key_id, drm_key, drm_headers, updated_at) '
+        . "VALUES (:source_id, :name, :tvg_id, :tvg_name, :tvg_language, :tvg_type, :group_title, "
+        . ':logo_url, :stream_url, :license_key_url, :attributes_json, :properties_json, :url_fields_json, :enabled, '
+        . ':drm_type, :drm_key_id, :drm_key, :drm_headers, :updated_at)'
+    );
+    $updateChannel = $db->prepare(
+        'UPDATE channels SET name = :name, tvg_id = :tvg_id, tvg_name = :tvg_name, tvg_language = :tvg_language, '
+        . 'tvg_type = :tvg_type, group_title = :group_title, logo_url = :logo_url, stream_url = :stream_url, '
+        . 'license_key_url = :license_key_url, attributes_json = :attributes_json, properties_json = :properties_json, '
+        . 'url_fields_json = :url_fields_json, enabled = :enabled, drm_type = :drm_type, drm_key_id = :drm_key_id, '
+        . 'drm_key = :drm_key, drm_headers = :drm_headers, updated_at = :updated_at WHERE id = :id'
+    );
+    $findFeed = $db->prepare('SELECT id FROM feeds WHERE channel_id = :channel_id AND stream_url = :stream_url');
+    $insertFeedStatement = $db->prepare(
+        'INSERT INTO feeds (channel_id, label, stream_url, license_key_url, drm_type, drm_key_id, drm_key, '
+        . 'drm_headers, properties_json, visibility, enabled, sort_order, updated_at) '
+        . "VALUES (:channel_id, :label, :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, "
+        . ':drm_headers, :properties_json, :visibility, :enabled, :sort_order, :updated_at)'
+    );
+    $updateFeedStatement = $db->prepare(
+        'UPDATE feeds SET label = :label, license_key_url = :license_key_url, drm_type = :drm_type, '
+        . 'drm_key_id = :drm_key_id, drm_key = :drm_key, drm_headers = :drm_headers, properties_json = :properties_json, '
+        . 'visibility = :visibility, enabled = :enabled, sort_order = :sort_order, updated_at = :updated_at WHERE id = :id'
+    );
+
+    $encode = static fn ($value): string => (string) (json_encode(
+        $value === null ? new stdClass() : $value,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+    ) ?: '{}');
+
+    $added = 0;
+    $updated = 0;
+    $feedsAdded = 0;
+    $feedsUpdated = 0;
+    $skipped = 0;
+    $now = gmdate('Y-m-d H:i:s');
+
+    $db->beginTransaction();
+    try {
+        if ($replace) {
+            $db->exec('DELETE FROM channels');
+        }
+
+        foreach ($channels as $entry) {
+            if (!is_array($entry)) {
+                $skipped++;
+                continue;
+            }
+            $name = trim((string) ($entry['name'] ?? ''));
+            $feeds = is_array($entry['feeds'] ?? null) ? $entry['feeds'] : [];
+            if ($name === '' || $feeds === []) {
+                $skipped++;
+                continue;
+            }
+
+            $sourceId = trim((string) ($entry['source_id'] ?? ''));
+            if ($sourceId === '') {
+                $sourceId = 'export-' . sha1($name);
+            }
+
+            $channelId = null;
+            $findChannelBySourceId->execute(['source_id' => $sourceId]);
+            $match = $findChannelBySourceId->fetchColumn();
+            if ($match !== false && $match !== null) {
+                $channelId = (int) $match;
+            }
+            if ($channelId === null && !$replace) {
+                $findChannelByName->execute(['name' => $name]);
+                $match = $findChannelByName->fetchColumn();
+                if ($match !== false && $match !== null) {
+                    $channelId = (int) $match;
+                }
+            }
+
+            $hasDrm = array_key_exists('drm_type', $entry)
+                || array_key_exists('drm_key_id', $entry)
+                || array_key_exists('drm_key', $entry)
+                || array_key_exists('drm_headers', $entry);
+
+            $firstFeed = is_array($feeds[0] ?? null) ? $feeds[0] : [];
+            $fields = [
+                'name' => $name,
+                'tvg_id' => (string) ($entry['tvg_id'] ?? ''),
+                'tvg_name' => (string) ($entry['tvg_name'] ?? ''),
+                'tvg_language' => (string) ($entry['tvg_language'] ?? ''),
+                'tvg_type' => (string) ($entry['tvg_type'] ?? ''),
+                'group_title' => (string) ($entry['group_title'] ?? ''),
+                'logo_url' => (string) ($entry['logo_url'] ?? ''),
+                'stream_url' => (string) ($firstFeed['stream_url'] ?? ''),
+                'license_key_url' => (string) ($firstFeed['license_key_url'] ?? ''),
+                'attributes_json' => $encode($entry['attributes'] ?? null),
+                'properties_json' => $encode($entry['properties'] ?? null),
+                'url_fields_json' => $encode($entry['url_fields'] ?? null),
+                'enabled' => !empty($entry['enabled']) ? 1 : 0,
+                'drm_type' => (string) ($entry['drm_type'] ?? ''),
+                'drm_key_id' => (string) ($entry['drm_key_id'] ?? ''),
+                'drm_key' => (string) ($entry['drm_key'] ?? ''),
+                'drm_headers' => (string) ($entry['drm_headers'] ?? ''),
+                'updated_at' => $now,
+            ];
+
+            if ($channelId === null) {
+                $insertChannel->execute($fields + ['source_id' => $sourceId]);
+                $channelId = (int) $db->lastInsertId();
+                $added++;
+            } else {
+                if (!$hasDrm) {
+                    unset($fields['drm_type'], $fields['drm_key_id'], $fields['drm_key'], $fields['drm_headers']);
+                }
+                $updateChannel->execute($fields + ['id' => $channelId]);
+                $updated++;
+            }
+
+            foreach ($feeds as $position => $feedEntry) {
+                if (!is_array($feedEntry)) {
+                    $skipped++;
+                    continue;
+                }
+                $streamUrl = trim((string) ($feedEntry['stream_url'] ?? ''));
+                if ($streamUrl === '') {
+                    $skipped++;
+                    continue;
+                }
+                $feedHasDrm = array_key_exists('drm_type', $feedEntry)
+                    || array_key_exists('drm_key_id', $feedEntry)
+                    || array_key_exists('drm_key', $feedEntry)
+                    || array_key_exists('drm_headers', $feedEntry);
+                $visibility = (string) ($feedEntry['visibility'] ?? 'both');
+                if (!in_array($visibility, feedVisibilityOptions(), true)) {
+                    $visibility = 'both';
+                }
+                $feedFields = [
+                    'label' => (string) ($feedEntry['label'] ?? ''),
+                    'license_key_url' => (string) ($feedEntry['license_key_url'] ?? ''),
+                    'drm_type' => (string) ($feedEntry['drm_type'] ?? ''),
+                    'drm_key_id' => (string) ($feedEntry['drm_key_id'] ?? ''),
+                    'drm_key' => (string) ($feedEntry['drm_key'] ?? ''),
+                    'drm_headers' => (string) ($feedEntry['drm_headers'] ?? ''),
+                    'properties_json' => $encode($feedEntry['properties'] ?? null),
+                    'visibility' => $visibility,
+                    'enabled' => !empty($feedEntry['enabled']) ? 1 : 0,
+                    'sort_order' => (int) ($feedEntry['sort_order'] ?? $position),
+                    'updated_at' => $now,
+                ];
+
+                $findFeed->execute(['channel_id' => $channelId, 'stream_url' => $streamUrl]);
+                $feedId = $findFeed->fetchColumn();
+                if ($feedId !== false && $feedId !== null) {
+                    if (!$feedHasDrm) {
+                        unset($feedFields['drm_type'], $feedFields['drm_key_id'], $feedFields['drm_key'], $feedFields['drm_headers']);
+                    }
+                    $updateFeedStatement->execute($feedFields + ['id' => (int) $feedId]);
+                    $feedsUpdated++;
+                    continue;
+                }
+                if (!$feedHasDrm) {
+                    unset($feedFields['drm_type'], $feedFields['drm_key_id'], $feedFields['drm_key'], $feedFields['drm_headers']);
+                }
+                $insertFeedStatement->execute($feedFields + [
+                    'channel_id' => $channelId,
+                    'stream_url' => $streamUrl,
+                ]);
+                $feedsAdded++;
+            }
+        }
+        $db->commit();
+    } catch (Throwable $error) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        throw $error;
+    }
+
+    return [
+        'channels_added' => $added,
+        'channels_updated' => $updated,
+        'feeds_added' => $feedsAdded,
+        'feeds_updated' => $feedsUpdated,
+        'skipped' => $skipped,
+        'total' => count($channels),
+        'mode' => $replace ? 'replace' : 'merge',
+    ];
+}
+
 function normalizeEpgUrl(string $url): string
 {
     $url = trim($url);

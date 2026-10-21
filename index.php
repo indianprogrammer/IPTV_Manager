@@ -91,6 +91,23 @@ function readDrmFields(array $source, string $licenseKeyUrl): array
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
+    if ($action === '' && (int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
+        $postLimit = ini_get('post_max_size') ?: '0';
+        $postBytes = (int) $postLimit;
+        if (preg_match('/^(\d+)([KMG]?)$/i', trim($postLimit), $matches)) {
+            $multipliers = ['' => 1, 'K' => 1024, 'M' => 1048576, 'G' => 1073741824];
+            $postBytes = (int) $matches[1] * ($multipliers[strtoupper($matches[2])] ?? 1);
+        }
+        if ($postBytes > 0 && (int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > $postBytes) {
+            flash(sprintf(
+                'The request was rejected before it reached the app — it is larger than the server limit (post_max_size = %s, upload_max_filesize = %s).',
+                $postLimit,
+                ini_get('upload_max_filesize') ?: 'unknown'
+            ), 'error');
+            redirect('index.php?import=1');
+        }
+    }
+
     if ($action === 'login') {
         requireCsrf();
         $username = trim((string) ($_POST['username'] ?? ''));
@@ -454,6 +471,62 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $result['updated'],
                 $result['skipped']
             ));
+        } elseif ($action === 'channel_import') {
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(300);
+            }
+            $uploaded = $_FILES['export_file'] ?? null;
+            if (!is_array($uploaded) || (int) ($uploaded['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) {
+                throw new RuntimeException('Choose a channel export file to upload.');
+            }
+            if ((int) $uploaded['error'] !== UPLOAD_ERR_OK) {
+                $uploadErrors = [
+                    UPLOAD_ERR_INI_SIZE => sprintf(
+                        'The export file is larger than the server upload limit (%s). Increase upload_max_filesize and post_max_size for the PHP server.',
+                        ini_get('upload_max_filesize') ?: 'unknown'
+                    ),
+                    UPLOAD_ERR_FORM_SIZE => 'The export file is larger than the upload limit allowed by the form.',
+                    UPLOAD_ERR_PARTIAL => 'The export file was only partially uploaded — try again.',
+                    UPLOAD_ERR_NO_TMP_DIR => 'The server has no temporary directory for uploads.',
+                    UPLOAD_ERR_CANT_WRITE => 'The server could not write the uploaded export file to disk.',
+                    UPLOAD_ERR_EXTENSION => 'A PHP extension stopped the upload.',
+                ];
+                $uploadError = (int) $uploaded['error'];
+                throw new RuntimeException(
+                    $uploadErrors[$uploadError] ?? ('The export upload failed (error code ' . $uploadError . ').')
+                );
+            }
+            $temporary = (string) ($uploaded['tmp_name'] ?? '');
+            if ($temporary === '' || !is_uploaded_file($temporary)) {
+                throw new RuntimeException('The uploaded export file is not readable.');
+            }
+            $size = (int) ($uploaded['size'] ?? 0);
+            if ($size <= 0 || $size > 50 * 1024 * 1024) {
+                throw new RuntimeException('The export file must be between 1 byte and 50 MB.');
+            }
+            $content = file_get_contents($temporary);
+            if ($content === false) {
+                throw new RuntimeException('Unable to read the uploaded export file.');
+            }
+            $payload = json_decode($content, true);
+            if (!is_array($payload)) {
+                throw new RuntimeException('The export file is not valid JSON.');
+            }
+            $importMode = (string) ($_POST['import_mode'] ?? 'merge') === 'replace' ? 'replace' : 'merge';
+            if ($importMode === 'replace' && (string) ($_POST['confirm_replace'] ?? '') !== '1') {
+                throw new RuntimeException('Confirm the replacement — it deletes every existing channel first.');
+            }
+            $result = importChannelData($db, $payload, $importMode);
+            bumpCacheVersion($db);
+            flash(sprintf(
+                'Channel export imported (%s): %d channels added, %d updated, %d feeds added, %d feeds updated, %d skipped.',
+                $importMode === 'replace' ? 'replace' : 'merge',
+                $result['channels_added'],
+                $result['channels_updated'],
+                $result['feeds_added'],
+                $result['feeds_updated'],
+                $result['skipped']
+            ));
         } elseif ($action === 'debug_toggle') {
             $enabled = !requestDebugEnabled();
             setRequestDebugMode($enabled);
@@ -616,6 +689,32 @@ if (isset($_GET['tail'])) {
         'size' => $logSize,
         'entries' => readRequestLog(200),
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (is_string($_GET['export'] ?? null) && $_GET['export'] === 'channels') {
+    if (!$loggedIn) {
+        http_response_code(401);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['error' => 'Sign-in required.']);
+        exit;
+    }
+    $exportScope = (string) ($_GET['scope'] ?? 'all');
+    if (!in_array($exportScope, ['all', 'enabled', 'disabled'], true)) {
+        $exportScope = 'all';
+    }
+    $exportCategory = trim((string) ($_GET['category'] ?? ''));
+    $exportJson = exportChannelJson($db, [
+        'scope' => $exportScope,
+        'category' => $exportCategory,
+        'include_drm' => (string) ($_GET['drm'] ?? '1') === '1',
+    ]);
+    $exportName = 'iptv-manager-channels-' . gmdate('Y-m-d') . '.json';
+    header('Content-Type: application/json; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $exportName . '"');
+    header('Content-Length: ' . strlen($exportJson));
+    header('Cache-Control: no-store');
+    echo $exportJson;
     exit;
 }
 
@@ -1001,6 +1100,7 @@ function logDetailFields(array $entry): array
     );
     $addChannel = isset($_GET['add']);
     $importPlaylist = isset($_GET['import']);
+    $exportChannels = $loggedIn && is_string($_GET['export'] ?? null) && $_GET['export'] === 'page';
     if ($guideMode) {
         $epgUrl = metaValue($db, 'epg_url');
         $epgLastImport = (int) metaValue($db, 'epg_last_import', '0');
@@ -1199,12 +1299,13 @@ function logDetailFields(array $entry): array
     <header class="topbar">
         <a class="brand" href="index.php"><span class="brand-mark small">▶</span><span>IPTV <b>Manager</b></span></a>
         <div class="topbar-right">
-            <a class="button text-button" href="index.php"<?= (!$guideMode && !$logMode && !$securityMode && !$addChannel && !$importPlaylist && !$manageCategories && !$editChannel) ? ' aria-current="page"' : '' ?>>Dashboard</a>
+            <a class="button text-button" href="index.php"<?= (!$guideMode && !$logMode && !$securityMode && !$addChannel && !$importPlaylist && !$exportChannels && !$manageCategories && !$editChannel) ? ' aria-current="page"' : '' ?>>Dashboard</a>
             <a class="button text-button" href="index.php?guide=1"<?= $guideMode ? ' aria-current="page"' : '' ?>>TV Guide</a>
             <a class="button text-button" href="index.php?log=1"<?= $logMode ? ' aria-current="page"' : '' ?>>Live log</a>
             <a class="button text-button" href="index.php?security=1"<?= $securityMode ? ' aria-current="page"' : '' ?>>Security</a>
             <a class="button text-button" href="index.php?add=1"<?= $addChannel ? ' aria-current="page"' : '' ?>>Add channel</a>
             <a class="button text-button" href="index.php?import=1"<?= $importPlaylist ? ' aria-current="page"' : '' ?>>Import playlist</a>
+            <a class="button text-button" href="index.php?export=page"<?= $exportChannels ? ' aria-current="page"' : '' ?>>Export channels</a>
             <a class="button text-button categories-link" href="index.php?categories=1"<?= $manageCategories ? ' aria-current="page"' : '' ?>>Manage categories</a>
                 <a class="button text-button" href="<?= h($playlistUrl) ?>" download="iptv-manager.m3u">Download M3U</a>
                 <a class="button text-button" href="<?= h($clearUrl) ?>" download="iptv-manager-clear.m3u">Clear M3U</a>
@@ -1429,6 +1530,71 @@ function logDetailFields(array $entry): array
                     <p class="muted">Fill in the file or the URL — if both are given, the file is used. Gzip-compressed playlists are supported.</p>
                     <div class="form-actions">
                         <button class="button primary" type="submit">Import playlist</button>
+                        <a class="button secondary" href="index.php">Cancel</a>
+                    </div>
+                </form>
+            </section>
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow">IMPORT CHANNEL EXPORT</p>
+                        <h2>Restore a JSON channel export</h2>
+                        <p class="muted">Upload a file created with "Export channels". <strong>Merge</strong> keeps the current library and adds or updates the channels in the file. <strong>Replace</strong> deletes every existing channel first and restores the file exactly.</p>
+                    </div>
+                </div>
+                <form method="post" action="index.php?import=1" enctype="multipart/form-data" class="channel-edit-form">
+                    <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                    <input type="hidden" name="action" value="channel_import">
+                    <div class="form-grid">
+                        <label class="span-2">Export file<input type="file" name="export_file" accept=".json,application/json"></label>
+                        <label>Mode
+                            <select name="import_mode">
+                                <option value="merge">Merge with the current library</option>
+                                <option value="replace">Replace every channel</option>
+                            </select>
+                        </label>
+                        <label class="checkbox-label"><input type="checkbox" name="confirm_replace" value="1"> I understand that "replace" deletes all existing channels</label>
+                    </div>
+                    <p class="muted">Channels are matched by their export id, then by name, so importing the same file twice does not create duplicates.</p>
+                    <div class="form-actions">
+                        <button class="button primary" type="submit">Import channels</button>
+                        <a class="button secondary" href="index.php">Cancel</a>
+                    </div>
+                </form>
+            </section>
+        <?php elseif ($exportChannels): ?>
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow">EXPORT CHANNELS</p>
+                        <h2>Download the channel library</h2>
+                        <p class="muted">Export every channel with its feeds, logo, category, language, DRM settings and feed visibility as a JSON file. Import it on another server to move the whole library, or keep it as a backup.</p>
+                    </div>
+                    <a class="button secondary" href="index.php">Back to channels</a>
+                </div>
+                <form method="get" action="index.php" class="channel-edit-form">
+                    <input type="hidden" name="export" value="channels">
+                    <div class="form-grid">
+                        <label>Channels
+                            <select name="scope">
+                                <option value="all">All channels</option>
+                                <option value="enabled">Enabled only</option>
+                                <option value="disabled">Disabled only</option>
+                            </select>
+                        </label>
+                        <label>Category
+                            <select name="category">
+                                <option value="">All categories</option>
+                                <?php foreach ($categories as $item): ?>
+                                    <option value="<?= h((string) $item) ?>"><?= h((string) $item) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </label>
+                        <label class="checkbox-label span-2"><input type="checkbox" name="drm" value="1" checked> Include DRM settings (license URLs, keys and request headers)</label>
+                    </div>
+                    <p class="muted">The file contains your DRM keys and license URLs — keep it private. The TV guide is not part of the export; it is imported separately from the XMLTV source.</p>
+                    <div class="form-actions">
+                        <button class="button primary" type="submit">Download JSON export</button>
                         <a class="button secondary" href="index.php">Cancel</a>
                     </div>
                 </form>
