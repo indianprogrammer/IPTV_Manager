@@ -123,7 +123,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     requireCsrf();
 
     try {
-        if ($action === 'purge_cache') {
+        if ($action === 'change_password') {
+            $current = (string) ($_POST['current_password'] ?? '');
+            $new = (string) ($_POST['new_password'] ?? '');
+            $confirm = (string) ($_POST['confirm_password'] ?? '');
+            if ($new === '') {
+                throw new RuntimeException('Enter a new password.');
+            }
+            if ($new !== $confirm) {
+                throw new RuntimeException('New passwords do not match.');
+            }
+            $statement = $db->prepare('SELECT password_hash FROM admins WHERE username = :username');
+            $statement->execute(['username' => $_SESSION['admin']]);
+            $admin = $statement->fetch();
+            if (!$admin || !password_verify($current, $admin['password_hash'])) {
+                throw new RuntimeException('Current password is incorrect.');
+            }
+            $update = $db->prepare('UPDATE admins SET password_hash = :hash WHERE username = :username');
+            $update->execute([
+                'hash' => password_hash($new, PASSWORD_DEFAULT),
+                'username' => $_SESSION['admin'],
+            ]);
+            flash('Password updated successfully.');
+        } elseif ($action === 'purge_cache') {
             purgeCache();
             flash('Cache purged.');
         } elseif ($action === 'toggle') {
@@ -1112,10 +1134,14 @@ function logDetailFields(array $entry): array
                             <small><span class="online-dot"></span>Signed in</small>
                         </div>
                     </div>
+                    <button class="user-menu-item" type="button" id="open-change-password">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                        Change password
+                    </button>
                     <form method="post" class="user-menu-form">
                         <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
                         <input type="hidden" name="action" value="logout">
-                        <button class="user-menu-item" type="submit">
+                        <button class="user-menu-item danger" type="submit">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
                             Sign out
                         </button>
@@ -2161,6 +2187,37 @@ function logDetailFields(array $entry): array
             </footer>
         </form>
     </dialog>
+    <dialog class="logo-dialog" id="password-dialog" aria-labelledby="password-dialog-title">
+        <form method="post" class="logo-dialog-form">
+            <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+            <input type="hidden" name="action" value="change_password">
+            <header class="dialog-head">
+                <div>
+                    <p class="eyebrow">ACCOUNT</p>
+                    <h2 id="password-dialog-title">Change password</h2>
+                </div>
+                <button class="button secondary small-button" type="button" data-dialog-close="password-dialog">Close</button>
+            </header>
+            <div class="dialog-body">
+                <label class="field">
+                    <span>Current password</span>
+                    <input type="password" name="current_password" autocomplete="current-password" required>
+                </label>
+                <label class="field">
+                    <span>New password</span>
+                    <input type="password" name="new_password" autocomplete="new-password" required>
+                </label>
+                <label class="field">
+                    <span>Confirm new password</span>
+                    <input type="password" name="confirm_password" autocomplete="new-password" required>
+                </label>
+            </div>
+            <footer class="dialog-foot">
+                <button class="button secondary" type="button" data-dialog-close="password-dialog">Cancel</button>
+                <button class="button" type="submit">Update password</button>
+            </footer>
+        </form>
+    </dialog>
     <script>
     (() => {
         const openDialog = (id) => {
@@ -2272,6 +2329,18 @@ function logDetailFields(array $entry): array
                 renameName.focus();
                 renameName.select();
             });
+        });
+        const openPassword = document.getElementById('open-change-password');
+        openPassword && openPassword.addEventListener('click', () => {
+            const menuPanel = document.getElementById('user-menu-panel');
+            if (menuPanel) {
+                menuPanel.hidden = true;
+            }
+            const toggle = document.getElementById('user-menu-toggle');
+            if (toggle) {
+                toggle.setAttribute('aria-expanded', 'false');
+            }
+            openDialog('password-dialog');
         });
     })();
     </script>

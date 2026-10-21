@@ -40,8 +40,10 @@ button, input, select { font: inherit; }
 .user-menu-head strong { display: block; font-size: 13px; }
 .user-menu-head small { display: inline-flex; align-items: center; gap: 6px; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .user-menu-form { margin: 0; }
-.user-menu-item { width: 100%; min-height: 38px; margin-top: 6px; padding: 0 10px; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 9px; background: transparent; color: #bb3d49; cursor: pointer; font-size: 13px; font-weight: 600; text-align: left; transition: background .15s; }
-.user-menu-item:hover { background: #fff1f2; }
+.user-menu-item { width: 100%; min-height: 38px; margin-top: 6px; padding: 0 10px; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 9px; background: transparent; color: var(--ink); cursor: pointer; font-size: 13px; font-weight: 600; text-align: left; transition: background .15s; }
+.user-menu-item:hover { background: #f7f9fc; }
+.user-menu-item.danger { color: #bb3d49; }
+.user-menu-item.danger:hover { background: #fff1f2; }
 .user-menu-item svg { width: 15px; height: 15px; }
 .page { width: min(1500px, 91%); margin: 40px auto 24px; }
 h1, h2, p { margin-top: 0; }
