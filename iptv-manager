@@ -42,12 +42,19 @@ load_dotenv() {
 
 load_dotenv "$PROJECT_DIR/.env"
 
+if [ ! -r "$PROJECT_DIR/php-detect.sh" ]; then
+    echo "Error: php-detect.sh is missing next to this script." >&2
+    exit 1
+fi
+. "$PROJECT_DIR/php-detect.sh"
+
 HOST=${IPTV_HOST:-127.0.0.1}
 WEB_PORT=${IPTV_PORT:-8000}
 PLAYLIST_PORT=${IPTV_PLAYLIST_PORT:-8001}
 CLEAR_PORT=${IPTV_CLEAR_PORT:-8002}
 AUTO_PORT=${IPTV_AUTO_PORT:-8003}
-PHP_BIN=${PHP_BIN:-$(command -v php || true)}
+PREFERRED_PHP_BIN=${PHP_BIN:-}
+PHP_BIN=$(php_resolve_bin || true)
 
 usage() {
     echo "Usage: $0 {start|stop|restart|status|run}" >&2
@@ -255,12 +262,21 @@ run_foreground() {
 
 start_all() {
     if [ -z "$PHP_BIN" ]; then
-        echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
+        if [ "$(id -u)" -eq 0 ]; then
+            php_ensure_sqlite || true
+            PHP_BIN=$(php_resolve_bin || true)
+        fi
+    fi
+    if [ -z "$PHP_BIN" ]; then
+        php_report_missing_sqlite
         return 1
     fi
-    if ! "$PHP_BIN" -m 2>/dev/null | grep -qi '^pdo_sqlite$'; then
-        echo "Error: PHP must have the PDO SQLite extension enabled." >&2
+    if ! php_has_pdo_sqlite "$PHP_BIN"; then
+        php_report_missing_sqlite
         return 1
+    fi
+    if [ -n "$PREFERRED_PHP_BIN" ] && [ "$PREFERRED_PHP_BIN" != "$PHP_BIN" ]; then
+        echo "Notice: $PREFERRED_PHP_BIN has no pdo_sqlite extension — using $PHP_BIN instead." >&2
     fi
     if [ "$WEB_PORT" = "$PLAYLIST_PORT" ] || [ "$WEB_PORT" = "$CLEAR_PORT" ] || [ "$WEB_PORT" = "$AUTO_PORT" ] \
         || [ "$PLAYLIST_PORT" = "$CLEAR_PORT" ] || [ "$PLAYLIST_PORT" = "$AUTO_PORT" ] || [ "$CLEAR_PORT" = "$AUTO_PORT" ]; then

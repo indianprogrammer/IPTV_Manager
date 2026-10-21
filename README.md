@@ -140,7 +140,9 @@ Ports and bind address are read from a `.env` file in the project root (see `.en
 | `IPTV_AUTO_PORT` | `8003` | Auto feed port — the user-agent rule picks the playlist |
 | `IPTV_DEBUG` | `0` | Default live-log debug mode (overridden by the UI toggle stored in the DB) |
 | `IPTV_UA_ENFORCE` | `1` | User-agent allow-list enforcement (overridden by the UI toggle stored in the DB) |
-| `PHP_BIN` | `php` | PHP binary used by the launcher |
+| `PHP_BIN` | `php` | PHP binary used by the launcher — must have the PDO SQLite extension |
+
+**PHP detection.** The launcher and the service installer look for a PHP CLI binary that has `pdo_sqlite` enabled: the configured `PHP_BIN` first, then `php` from `PATH`, then the versioned binaries in `/usr/bin` and `/usr/local/bin`. A configured binary without the extension is skipped with a notice and a working one is used instead. If no PHP on the machine has `pdo_sqlite`, the service installer (running as root) installs the matching `phpX.Y-sqlite3` package automatically; otherwise the exact `apt install` command is printed.
 
 Example: expose to a trusted LAN on other ports — edit `.env`:
 
@@ -261,6 +263,7 @@ router.php       Per-port routing and style.css cache headers
 style.css        UI styling
 iptv-manager     start / stop / restart / status / run launcher
 iptv-manager-service  installs the launcher as a systemd (or init.d) service
+php-detect.sh    Finds a PHP CLI binary that has the PDO SQLite extension
 .env.example     Configuration template (copy to .env)
 docs/screenshots README screenshots
 data/            SQLite DB, cache, request log, PID files (git-ignored)

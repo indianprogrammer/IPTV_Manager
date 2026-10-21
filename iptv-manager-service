@@ -18,6 +18,12 @@ SYSV_INIT="/etc/init.d/$SERVICE_NAME"
 SERVICE_USER=${IPTV_SERVICE_USER:-}
 SYSTEMD_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+if [ ! -r "$PROJECT_DIR/php-detect.sh" ]; then
+    echo "Error: php-detect.sh is missing next to this script." >&2
+    exit 1
+fi
+. "$PROJECT_DIR/php-detect.sh"
+
 usage() {
     cat >&2 <<EOF
 Usage: sudo $0 {install|uninstall|enable|disable|start|stop|restart|status|logs|print-unit}
@@ -60,9 +66,9 @@ read_env_value() {
                 *) continue ;;
             esac
             name=${line%%=*}
-            value=${line#*=}
             name=${name//[[:space:]]/}
             [ "$name" = "$key" ] || continue
+            value=${line#*=}
             if [ "${#value}" -ge 2 ]; then
                 case $value in
                     \"*\") value=${value#\"}; value=${value%\"} ;;
@@ -104,19 +110,23 @@ resolve_service_user() {
 }
 
 resolve_php_bin() {
-    local configured
+    local configured resolved
     configured=$(config_value PHP_BIN "")
     if [ -n "$configured" ]; then
-        if [ -x "$configured" ]; then
+        if php_has_pdo_sqlite "$configured"; then
             printf '%s\n' "$configured"
             return 0
         fi
         if command -v "$configured" >/dev/null 2>&1; then
-            command -v "$configured"
-            return 0
+            configured=$(command -v "$configured")
         fi
+        echo "Notice: $configured has no pdo_sqlite extension — using another PHP binary." >&2
+        resolved=$(PHP_BIN="$configured" php_resolve_bin || true)
+        [ -n "$resolved" ] || return 1
+        printf '%s\n' "$resolved"
+        return 0
     fi
-    command -v php 2>/dev/null || true
+    php_resolve_bin
 }
 
 run_as_service_user() {
@@ -393,9 +403,9 @@ main() {
                 exit 1
             fi
             SERVICE_GROUP=$(id -gn "$SERVICE_USER")
-            PHP_BIN=$(resolve_php_bin)
+            PHP_BIN=$(resolve_php_bin || true)
             if [ -z "$PHP_BIN" ]; then
-                echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
+                php_report_missing_sqlite
                 exit 1
             fi
             unit_content
@@ -415,9 +425,12 @@ main() {
                 exit 1
             fi
             SERVICE_GROUP=$(id -gn "$SERVICE_USER")
-            PHP_BIN=$(resolve_php_bin)
+            if [ "$action" = install ]; then
+                php_ensure_sqlite || true
+            fi
+            PHP_BIN=$(resolve_php_bin || true)
             if [ -z "$PHP_BIN" ]; then
-                echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
+                php_report_missing_sqlite
                 exit 1
             fi
             if have_systemd; then
