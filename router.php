@@ -43,8 +43,13 @@ if ($serverPort === $playlistPort) {
     exit;
 }
 
-if ($serverPort === $webPort && !in_array($requestPath, ['/', '/index.php', '/style.css'], true)) {
+if ($serverPort === $webPort && !in_array($requestPath, ['/', '/index.php', '/style.css', '/logo.php'], true)) {
     header('Location: /', true, 302);
+    exit;
+}
+
+if ($serverPort === $webPort && $requestPath === '/logo.php') {
+    require __DIR__ . '/logo.php';
     exit;
 }
 

@@ -234,6 +234,79 @@ function cacheDirectory(): string
     return $directory;
 }
 
+function logoDirectory(): string
+{
+    $directory = __DIR__ . '/data/logos';
+    if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
+        throw new RuntimeException('Unable to create the logo directory.');
+    }
+    return $directory;
+}
+
+function logoMimeExtensions(): array
+{
+    return [
+        'image/png' => 'png',
+        'image/jpeg' => 'jpg',
+        'image/gif' => 'gif',
+        'image/webp' => 'webp',
+        'image/svg+xml' => 'svg',
+        'image/x-icon' => 'ico',
+        'image/vnd.microsoft.icon' => 'ico',
+        'image/bmp' => 'bmp',
+    ];
+}
+
+function storeUploadedLogo(string $temporaryPath, string $originalName): string
+{
+    $info = @getimagesize($temporaryPath);
+    $mime = is_array($info) ? (string) ($info['mime'] ?? '') : '';
+    if ($mime === '') {
+        $finfo = new finfo(FILEINFO_MIME_TYPE);
+        $mime = (string) $finfo->file($temporaryPath);
+    }
+    $extensions = logoMimeExtensions();
+    if (!isset($extensions[$mime])) {
+        throw new RuntimeException('Unsupported image type. Use PNG, JPG, GIF, WEBP, SVG, ICO or BMP.');
+    }
+    if ($mime === 'image/svg+xml') {
+        $contents = (string) file_get_contents($temporaryPath);
+        if (preg_match('/<script|onload=|onerror=|javascript:/i', $contents)) {
+            throw new RuntimeException('The SVG logo contains unsupported active content.');
+        }
+    }
+    $directory = logoDirectory();
+    $stored = bin2hex(random_bytes(16)) . '.' . $extensions[$mime];
+    $destination = $directory . '/' . $stored;
+    if (!move_uploaded_file($temporaryPath, $destination) && !rename($temporaryPath, $destination)) {
+        throw new RuntimeException('Unable to store the uploaded logo.');
+    }
+    @chmod($destination, 0600);
+    return 'logo.php?f=' . rawurlencode($stored);
+}
+
+function resolveLogoFile(string $name): ?string
+{
+    $name = basename($name);
+    if ($name === '' || !preg_match('/^[a-f0-9]{32}\.[a-z0-9]{2,5}$/', $name)) {
+        return null;
+    }
+    $path = logoDirectory() . '/' . $name;
+    return is_file($path) ? $path : null;
+}
+
+function absoluteLogoUrl(string $url): string
+{
+    if ($url === '' || !str_starts_with($url, 'logo.php?')) {
+        return $url;
+    }
+    if (PHP_SAPI === 'cli' || empty($_SERVER['HTTP_HOST'])) {
+        return $url;
+    }
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    return $scheme . '://' . $_SERVER['HTTP_HOST'] . '/' . $url;
+}
+
 function databaseSignature(): string
 {
     clearstatcache(true);
@@ -563,7 +636,7 @@ function buildPlaylist(PDO $db, bool $clearOnly = false): string
         $attributes = [
             'tvg-id' => $feed['tvg_id'],
             'tvg-name' => $feed['tvg_name'],
-            'tvg-logo' => $feed['logo_url'],
+            'tvg-logo' => absoluteLogoUrl((string) $feed['logo_url']),
             'tvg-language' => $feed['tvg_language'],
             'tvg-type' => $feed['tvg_type'],
             'group-title' => $feed['group_title'],

@@ -2,6 +2,7 @@
 /data/iptv.sqlite-shm
 /data/iptv.sqlite-wal
 /data/cache/
+/data/logos/
 /data/*.pid
 /data/*.log
 /data/requests.log

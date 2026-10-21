@@ -229,6 +229,60 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'id' => filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT),
             ]);
             flash('Channel details saved.');
+        } elseif ($action === 'channel_rename') {
+            $channelId = (int) filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT);
+            $name = trim((string) ($_POST['name'] ?? ''));
+            if ($name === '') {
+                throw new RuntimeException('Channel name is required.');
+            }
+            $statement = $db->prepare('UPDATE channels SET name = :name, tvg_name = :tvg_name, updated_at = :updated_at WHERE id = :id');
+            $statement->execute([
+                'name' => $name,
+                'tvg_name' => trim((string) ($_POST['tvg_name'] ?? '')),
+                'updated_at' => gmdate('Y-m-d H:i:s'),
+                'id' => $channelId,
+            ]);
+            flash('Channel renamed to "' . $name . '".');
+        } elseif ($action === 'channel_logo') {
+            $channelId = (int) filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT);
+            if ($channelId <= 0) {
+                throw new RuntimeException('Channel not found.');
+            }
+            $check = $db->prepare('SELECT id FROM channels WHERE id = :id');
+            $check->execute(['id' => $channelId]);
+            if (!$check->fetchColumn()) {
+                throw new RuntimeException('Channel not found.');
+            }
+
+            $logoUrl = trim((string) ($_POST['logo_url'] ?? ''));
+            $uploaded = $_FILES['logo_file'] ?? null;
+            $hasUpload = is_array($uploaded) && (int) ($uploaded['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE;
+
+            if ($hasUpload) {
+                if ((int) $uploaded['error'] !== UPLOAD_ERR_OK) {
+                    throw new RuntimeException('The logo upload failed (error code ' . (int) $uploaded['error'] . ').');
+                }
+                $temporary = (string) ($uploaded['tmp_name'] ?? '');
+                if ($temporary === '' || !is_uploaded_file($temporary)) {
+                    throw new RuntimeException('The uploaded logo file is not readable.');
+                }
+                if ((int) ($uploaded['size'] ?? 0) > 5 * 1024 * 1024) {
+                    throw new RuntimeException('The logo image must be 5 MB or smaller.');
+                }
+                $logoUrl = storeUploadedLogo($temporary, (string) ($uploaded['name'] ?? 'logo'));
+            }
+
+            if ($logoUrl !== '' && !filter_var($logoUrl, FILTER_VALIDATE_URL) && !str_starts_with($logoUrl, 'logo.php?')) {
+                throw new RuntimeException('Enter a valid image URL or choose a file to upload.');
+            }
+
+            $statement = $db->prepare('UPDATE channels SET logo_url = :logo_url, updated_at = :updated_at WHERE id = :id');
+            $statement->execute([
+                'logo_url' => $logoUrl,
+                'updated_at' => gmdate('Y-m-d H:i:s'),
+                'id' => $channelId,
+            ]);
+            flash($logoUrl === '' ? 'Logo removed.' : 'Channel logo updated.');
         } elseif ($action === 'feed_create' || $action === 'feed_update') {
             $isCreate = $action === 'feed_create';
             $channelId = (int) filter_input(INPUT_POST, 'channel_id', FILTER_VALIDATE_INT);
@@ -1972,8 +2026,19 @@ function logDetailFields(array $entry): array
                             <td class="select-cell"><input type="checkbox" class="bulk-checkbox" name="ids[]" value="<?= (int) $channel['id'] ?>" form="bulk-delete-form" aria-label="Select <?= h($channel['name']) ?>"></td>
                             <td><div class="channel-cell">
                                 <?= statusButton((int) $channel['id'], (bool) $channel['enabled']) ?>
-                                <?php if ($channel['logo_url']): ?><img class="channel-logo" src="<?= h($channel['logo_url']) ?>" alt="" loading="lazy" referrerpolicy="no-referrer"><?php else: ?><span class="channel-logo placeholder">▶</span><?php endif; ?>
-                                <div><strong><?= h($channel['name']) ?></strong><small><?= h($channel['tvg_name']) ?></small></div>
+                                <button class="channel-logo-button" type="button" title="Change logo for <?= h($channel['name']) ?>" aria-label="Change logo for <?= h($channel['name']) ?>"
+                                    data-logo-action="index.php?<?= h(http_build_query($listParams)) ?>"
+                                    data-channel-id="<?= (int) $channel['id'] ?>"
+                                    data-channel-name="<?= h($channel['name']) ?>"
+                                    data-logo-url="<?= h((string) $channel['logo_url']) ?>">
+                                    <?php if ($channel['logo_url']): ?><img class="channel-logo" src="<?= h($channel['logo_url']) ?>" alt="" loading="lazy" referrerpolicy="no-referrer"><?php else: ?><span class="channel-logo placeholder">▶</span><?php endif; ?>
+                                    <span class="channel-logo-edit"><?= editIcon() ?></span>
+                                </button>
+                                <div><button class="channel-name-button" type="button" title="Rename <?= h($channel['name']) ?>"
+                                    data-rename-action="index.php?<?= h(http_build_query($listParams)) ?>"
+                                    data-channel-id="<?= (int) $channel['id'] ?>"
+                                    data-channel-name="<?= h($channel['name']) ?>"
+                                    data-channel-tvgname="<?= h((string) $channel['tvg_name']) ?>"><strong><?= h($channel['name']) ?></strong></button><small><?= h($channel['tvg_name']) ?></small></div>
                             </div></td>
                             <td class="monospace"><?= h($channel['tvg_id']) ?></td>
                             <td><span class="category-chip"><?= h($channel['group_title'] ?: 'Uncategorized') ?></span></td>
@@ -2034,6 +2099,182 @@ function logDetailFields(array $entry): array
             <p class="player-status" id="preview-player-status" role="status" hidden></p>
         </div>
     </dialog>
+    <dialog class="logo-dialog" id="logo-dialog" aria-labelledby="logo-dialog-title">
+        <form method="post" enctype="multipart/form-data" class="logo-dialog-form" id="logo-dialog-form">
+            <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+            <input type="hidden" name="action" value="channel_logo">
+            <input type="hidden" name="id" id="logo-dialog-id" value="">
+            <header class="dialog-head">
+                <div>
+                    <p class="eyebrow">CHANNEL LOGO</p>
+                    <h2 id="logo-dialog-title">Change logo</h2>
+                </div>
+                <button class="button secondary small-button" type="button" data-dialog-close="logo-dialog">Close</button>
+            </header>
+            <div class="dialog-body">
+                <div class="logo-dialog-preview">
+                    <img id="logo-dialog-preview-img" src="" alt="" hidden>
+                    <span class="channel-logo placeholder" id="logo-dialog-preview-fallback">▶</span>
+                </div>
+                <label class="field">
+                    <span>Image URL</span>
+                    <input type="url" name="logo_url" id="logo-dialog-url" placeholder="https://example.com/logo.png" autocomplete="off">
+                </label>
+                <div class="dialog-or"><span>or</span></div>
+                <label class="field">
+                    <span>Upload from computer</span>
+                    <input type="file" name="logo_file" id="logo-dialog-file" accept="image/*">
+                </label>
+                <p class="muted small-note">PNG, JPG, GIF, WEBP, SVG, ICO or BMP · up to 5 MB. Leave both empty to remove the logo.</p>
+            </div>
+            <footer class="dialog-foot">
+                <button class="button secondary" type="button" id="logo-dialog-remove">Remove logo</button>
+                <button class="button" type="submit">Save logo</button>
+            </footer>
+        </form>
+    </dialog>
+    <dialog class="logo-dialog" id="rename-dialog" aria-labelledby="rename-dialog-title">
+        <form method="post" class="logo-dialog-form" id="rename-dialog-form">
+            <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+            <input type="hidden" name="action" value="channel_rename">
+            <input type="hidden" name="id" id="rename-dialog-id" value="">
+            <header class="dialog-head">
+                <div>
+                    <p class="eyebrow">CHANNEL NAME</p>
+                    <h2 id="rename-dialog-title">Rename channel</h2>
+                </div>
+                <button class="button secondary small-button" type="button" data-dialog-close="rename-dialog">Close</button>
+            </header>
+            <div class="dialog-body">
+                <label class="field">
+                    <span>Channel name</span>
+                    <input type="text" name="name" id="rename-dialog-name" required autocomplete="off">
+                </label>
+                <label class="field">
+                    <span>TVG name</span>
+                    <input type="text" name="tvg_name" id="rename-dialog-tvgname" autocomplete="off">
+                </label>
+            </div>
+            <footer class="dialog-foot">
+                <button class="button secondary" type="button" data-dialog-close="rename-dialog">Cancel</button>
+                <button class="button" type="submit">Save name</button>
+            </footer>
+        </form>
+    </dialog>
+    <script>
+    (() => {
+        const openDialog = (id) => {
+            const dialog = document.getElementById(id);
+            if (dialog && typeof dialog.showModal === 'function') {
+                dialog.showModal();
+            }
+        };
+        const closeDialog = (id) => {
+            const dialog = document.getElementById(id);
+            if (dialog && dialog.open) {
+                dialog.close();
+            }
+        };
+        document.querySelectorAll('[data-dialog-close]').forEach((button) => {
+            button.addEventListener('click', () => closeDialog(button.getAttribute('data-dialog-close')));
+        });
+        document.querySelectorAll('.logo-dialog').forEach((dialog) => {
+            dialog.addEventListener('click', (event) => {
+                if (event.target === dialog) {
+                    dialog.close();
+                }
+            });
+        });
+
+        const logoDialog = document.getElementById('logo-dialog');
+        const logoForm = document.getElementById('logo-dialog-form');
+        const logoId = document.getElementById('logo-dialog-id');
+        const logoUrl = document.getElementById('logo-dialog-url');
+        const logoFile = document.getElementById('logo-dialog-file');
+        const logoPreviewImg = document.getElementById('logo-dialog-preview-img');
+        const logoPreviewFallback = document.getElementById('logo-dialog-preview-fallback');
+
+        const renderLogoPreview = (src) => {
+            if (!logoPreviewImg || !logoPreviewFallback) {
+                return;
+            }
+            if (src) {
+                logoPreviewImg.src = src;
+                logoPreviewImg.hidden = false;
+                logoPreviewFallback.hidden = true;
+            } else {
+                logoPreviewImg.hidden = true;
+                logoPreviewImg.removeAttribute('src');
+                logoPreviewFallback.hidden = false;
+            }
+        };
+
+        if (logoForm) {
+            logoForm.addEventListener('submit', () => {
+                if (logoFile && logoFile.files.length === 0) {
+                    logoFile.disabled = true;
+                }
+            });
+            logoUrl && logoUrl.addEventListener('input', () => renderLogoPreview(logoUrl.value.trim()));
+            logoFile && logoFile.addEventListener('change', () => {
+                if (logoFile.files.length > 0) {
+                    renderLogoPreview(URL.createObjectURL(logoFile.files[0]));
+                } else if (logoUrl) {
+                    renderLogoPreview(logoUrl.value.trim());
+                }
+            });
+        }
+
+        document.querySelectorAll('[data-logo-action]').forEach((button) => {
+            button.addEventListener('click', () => {
+                if (!logoForm) {
+                    return;
+                }
+                logoForm.setAttribute('action', button.getAttribute('data-logo-action') || 'index.php');
+                logoId.value = button.getAttribute('data-channel-id') || '';
+                logoUrl.value = button.getAttribute('data-logo-url') || '';
+                logoFile.value = '';
+                const title = document.getElementById('logo-dialog-title');
+                if (title) {
+                    title.textContent = 'Logo · ' + (button.getAttribute('data-channel-name') || 'channel');
+                }
+                renderLogoPreview(logoUrl.value.trim());
+                openDialog('logo-dialog');
+            });
+        });
+
+        const removeButton = document.getElementById('logo-dialog-remove');
+        removeButton && removeButton.addEventListener('click', () => {
+            if (logoUrl) {
+                logoUrl.value = '';
+            }
+            if (logoFile) {
+                logoFile.value = '';
+            }
+            renderLogoPreview('');
+            logoForm && logoForm.requestSubmit();
+        });
+
+        const renameForm = document.getElementById('rename-dialog-form');
+        const renameId = document.getElementById('rename-dialog-id');
+        const renameName = document.getElementById('rename-dialog-name');
+        const renameTvgName = document.getElementById('rename-dialog-tvgname');
+        document.querySelectorAll('[data-rename-action]').forEach((button) => {
+            button.addEventListener('click', () => {
+                if (!renameForm) {
+                    return;
+                }
+                renameForm.setAttribute('action', button.getAttribute('data-rename-action') || 'index.php');
+                renameId.value = button.getAttribute('data-channel-id') || '';
+                renameName.value = button.getAttribute('data-channel-name') || '';
+                renameTvgName.value = button.getAttribute('data-channel-tvgname') || '';
+                openDialog('rename-dialog');
+                renameName.focus();
+                renameName.select();
+            });
+        });
+    })();
+    </script>
     <script>
     (() => {
         const preview = document.getElementById('logo-preview');
