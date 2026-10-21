@@ -130,6 +130,10 @@ img.channel-logo { cursor: zoom-in; }
 .status-dot:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .manage-cell { display: flex; align-items: center; gap: 3px; }
 .inline-form { display: inline; }
+.select-cell { width: 34px; text-align: center; }
+.select-cell input { width: 15px; height: 15px; margin: 0; padding: 0; accent-color: var(--primary); cursor: pointer; }
+.bulk-delete-form { display: flex; align-items: center; }
+.bulk-delete-form button:disabled { opacity: .45; cursor: not-allowed; }
 .login-form label { display: grid; gap: 5px; color: #566276; font-size: 11px; font-weight: 600; }
 .login-form input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid #dfe4ed; border-radius: 8px; outline-color: var(--primary); color: var(--ink); }
 .pagination { padding: 15px 20px; display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 12px; }

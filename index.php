@@ -134,6 +134,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $statement = $db->prepare('DELETE FROM channels WHERE id = :id');
             $statement->execute(['id' => filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT)]);
             flash('Channel deleted.');
+        } elseif ($action === 'delete_selected') {
+            $postedIds = $_POST['ids'] ?? [];
+            $ids = [];
+            if (is_array($postedIds)) {
+                foreach ($postedIds as $postedId) {
+                    $id = (int) $postedId;
+                    if ($id > 0) {
+                        $ids[$id] = true;
+                    }
+                }
+            }
+            $ids = array_keys($ids);
+            if ($ids === []) {
+                throw new RuntimeException('Select at least one channel to delete.');
+            }
+            $placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $statement = $db->prepare('DELETE FROM channels WHERE id IN (' . $placeholders . ')');
+            $statement->execute($ids);
+            $count = $statement->rowCount();
+            flash('Deleted ' . number_format($count) . ' channel' . ($count === 1 ? '' : 's') . '.');
         } elseif ($action === 'create') {
             $name = trim((string) ($_POST['name'] ?? ''));
             if ($name === '') {
@@ -1015,10 +1035,16 @@ function statusButton(int $id, bool $enabled): string
                     <button class="button secondary" type="submit">Filter</button>
                     <?php if ($search !== '' || $category !== ''): ?><a class="clear-link" href="index.php">Clear</a><?php endif; ?>
                 </form>
+                <form method="post" id="bulk-delete-form" class="bulk-delete-form" onsubmit="return confirm('Delete ' + document.querySelectorAll('.bulk-checkbox:checked').length + ' selected channels?')">
+                    <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                    <input type="hidden" name="action" value="delete_selected">
+                    <button class="button danger-button" type="submit">Delete selected</button>
+                </form>
             </div>
             <div class="table-wrap">
                 <table>
                     <thead><tr>
+                        <th class="select-cell"><input type="checkbox" class="bulk-select-all" title="Select all channels on this page" aria-label="Select all channels on this page"></th>
                         <th>Channel</th><th>ID</th><th>Category</th><th>Language</th><th>Type</th>
                         <th>Logo URL</th><th>Stream URL</th><th>License URL</th>
                         <?php foreach ($visibleUrlColumns as $field): ?>
@@ -1028,7 +1054,7 @@ function statusButton(int $id, bool $enabled): string
                     </tr></thead>
                     <tbody>
                     <?php if (!$channels): ?>
-                        <tr><td colspan="<?= 9 + count($visibleUrlColumns) ?>" class="empty-state">
+                        <tr><td colspan="<?= 10 + count($visibleUrlColumns) ?>" class="empty-state">
                             <strong>No channels found</strong>
                             <span><?= (int) $stats['total'] === 0 ? 'Add a channel to start building your playlist.' : 'Try a different search or category.' ?></span>
                             <?php if ((int) $stats['total'] === 0): ?><a class="button secondary small-button empty-action" href="index.php?add=1">Add channel</a><?php endif; ?>
@@ -1037,6 +1063,7 @@ function statusButton(int $id, bool $enabled): string
                     <?php foreach ($channels as $channel): ?>
                         <?php $urls = json_decode($channel['url_fields_json'], true) ?: []; ?>
                         <tr>
+                            <td class="select-cell"><input type="checkbox" class="bulk-checkbox" name="ids[]" value="<?= (int) $channel['id'] ?>" form="bulk-delete-form" aria-label="Select <?= h($channel['name']) ?>"></td>
                             <td><div class="channel-cell">
                                 <?= statusButton((int) $channel['id'], (bool) $channel['enabled']) ?>
                                 <?php if ($channel['logo_url']): ?><img class="channel-logo" src="<?= h($channel['logo_url']) ?>" alt="" loading="lazy" referrerpolicy="no-referrer"><?php else: ?><span class="channel-logo placeholder">▶</span><?php endif; ?>
@@ -1295,6 +1322,35 @@ function statusButton(int $id, bool $enabled): string
                 playStream(data, requestToken);
             });
         });
+    })();
+    </script>
+    <script>
+    (() => {
+        const selectAll = document.querySelector('.bulk-select-all');
+        const bulkForm = document.getElementById('bulk-delete-form');
+        if (!selectAll || !bulkForm) {
+            return;
+        }
+        const boxes = Array.from(document.querySelectorAll('.bulk-checkbox'));
+        const button = bulkForm.querySelector('button[type="submit"]');
+        const syncButton = () => {
+            if (button) {
+                button.disabled = !boxes.some((box) => box.checked);
+            }
+        };
+        selectAll.addEventListener('change', () => {
+            boxes.forEach((box) => {
+                box.checked = selectAll.checked;
+            });
+            syncButton();
+        });
+        boxes.forEach((box) => box.addEventListener('change', () => {
+            if (!box.checked) {
+                selectAll.checked = false;
+            }
+            syncButton();
+        }));
+        syncButton();
     })();
     </script>
 <?php endif; ?>

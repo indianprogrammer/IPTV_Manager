@@ -10,6 +10,7 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 - Compact channel table with enable/disable status dot, logo, TVG ID, category, language, type, and URL columns
 - Search and category filtering with pagination
 - Add / edit / delete channels manually, or import an existing M3U playlist
+- Bulk select and delete channels (select-all on the current page)
 
 **Playlist import**
 - Import channels from an M3U/M3U8 playlist — uploaded as a file or fetched from a URL (gzip supported)
