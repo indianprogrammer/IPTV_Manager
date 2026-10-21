@@ -1,6 +1,57 @@
 <?php
 declare(strict_types=1);
 
+function loadEnvironmentFile(): void
+{
+    static $loaded = false;
+    if ($loaded) {
+        return;
+    }
+    $loaded = true;
+
+    $path = __DIR__ . '/.env';
+    if (!is_file($path) || !is_readable($path)) {
+        return;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return;
+    }
+
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#')) {
+            continue;
+        }
+
+        $separator = strpos($line, '=');
+        if ($separator === false) {
+            continue;
+        }
+
+        $name = trim(substr($line, 0, $separator));
+        $value = trim(substr($line, $separator + 1));
+        if ($name === '' || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+            continue;
+        }
+
+        $length = strlen($value);
+        if ($length >= 2 && ($value[0] === '"' || $value[0] === "'") && $value[$length - 1] === $value[0]) {
+            $value = substr($value, 1, -1);
+        }
+
+        if (getenv($name) !== false) {
+            continue;
+        }
+
+        putenv($name . '=' . $value);
+        $_ENV[$name] = $value;
+    }
+}
+
+loadEnvironmentFile();
+
 function databasePath(): string
 {
     return __DIR__ . '/data/iptv.sqlite';
@@ -434,6 +485,324 @@ function cachedPlaylist(PDO $db, bool $clearOnly = false): array
 function m3uEscape(string $value): string
 {
     return str_replace(['\\', '"', "\r", "\n"], ['\\\\', '\\"', '', ''], $value);
+}
+
+function normalizePlaylistUrl(string $url): string
+{
+    $url = trim($url);
+    $scheme = strtolower((string) parse_url($url, PHP_URL_SCHEME));
+    if ($url === '' || filter_var($url, FILTER_VALIDATE_URL) === false || !in_array($scheme, ['http', 'https'], true)) {
+        throw new RuntimeException('Enter a valid http or https playlist URL.');
+    }
+    return $url;
+}
+
+function maybeDecompressGzip(string $body): string
+{
+    if (!str_starts_with($body, "\x1f\x8b")) {
+        return $body;
+    }
+    $decoded = @gzdecode($body);
+    if ($decoded === false) {
+        throw new RuntimeException('Unable to decompress the gzip playlist.');
+    }
+    return $decoded;
+}
+
+function downloadPlaylist(string $url): string
+{
+    $url = normalizePlaylistUrl($url);
+
+    $limit = 50 * 1024 * 1024;
+    $tooLarge = false;
+    $curl = curl_init($url);
+    if ($curl === false) {
+        throw new RuntimeException('Unable to start the playlist download.');
+    }
+
+    $options = [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 120,
+        CURLOPT_USERAGENT => 'IPTV-Manager/1.0',
+        CURLOPT_FAILONERROR => true,
+        CURLOPT_ENCODING => '',
+        CURLOPT_NOPROGRESS => false,
+        CURLOPT_PROGRESSFUNCTION => static function ($resource, $downloadSize, $downloaded) use ($limit, &$tooLarge): int {
+            if ($downloaded > $limit) {
+                $tooLarge = true;
+                return 1;
+            }
+            return 0;
+        },
+    ];
+    if (defined('CURLOPT_PROTOCOLS_STR')) {
+        $options[CURLOPT_PROTOCOLS_STR] = 'http,https';
+        $options[CURLOPT_REDIR_PROTOCOLS_STR] = 'http,https';
+    }
+    curl_setopt_array($curl, $options);
+    $body = curl_exec($curl);
+    $error = curl_error($curl);
+    $status = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+    curl_close($curl);
+
+    if ($tooLarge) {
+        throw new RuntimeException('The playlist file is larger than 50 MB.');
+    }
+    if ($body === false) {
+        throw new RuntimeException('Unable to download the playlist: ' . ($error !== '' ? $error : 'request failed'));
+    }
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException('The playlist server returned HTTP ' . $status . '.');
+    }
+
+    $body = maybeDecompressGzip((string) $body);
+    if (trim($body) === '') {
+        throw new RuntimeException('The downloaded playlist was empty.');
+    }
+    return $body;
+}
+
+function nameFromStreamUrl(string $url): string
+{
+    $path = parse_url($url, PHP_URL_PATH);
+    $name = is_string($path) ? basename($path) : '';
+    return $name !== '' ? $name : $url;
+}
+
+function parseExtinfLine(string $line): array
+{
+    $entry = ['name' => '', 'attributes' => [], 'group_title' => '', 'properties' => [], 'stream_url' => ''];
+    $payload = substr($line, strlen('#EXTINF:'));
+
+    $length = strlen($payload);
+    $inQuotes = false;
+    $escaped = false;
+    $attributeEnd = null;
+    for ($position = 0; $position < $length; $position++) {
+        $character = $payload[$position];
+        if ($escaped) {
+            $escaped = false;
+        } elseif ($character === '\\' && $inQuotes) {
+            $escaped = true;
+        } elseif ($character === '"') {
+            $inQuotes = !$inQuotes;
+        } elseif ($character === ',' && !$inQuotes) {
+            $attributeEnd = $position;
+            break;
+        }
+    }
+
+    if ($attributeEnd === null) {
+        $entry['name'] = trim($payload);
+        return $entry;
+    }
+
+    $attributePart = substr($payload, 0, $attributeEnd);
+    $entry['name'] = trim(substr($payload, $attributeEnd + 1));
+    if (preg_match_all('/([\w.-]+)=("(?:[^"\\\\]|\\\\.)*"|[^"\s]+)/', $attributePart, $matches, PREG_SET_ORDER)) {
+        foreach ($matches as $match) {
+            $value = $match[2];
+            if (strlen($value) >= 2 && $value[0] === '"' && $value[strlen($value) - 1] === '"') {
+                $value = str_replace(['\\"', '\\\\'], ['"', '\\'], substr($value, 1, -1));
+            }
+            $entry['attributes'][$match[1]] = $value;
+        }
+    }
+    $entry['group_title'] = (string) ($entry['attributes']['group-title'] ?? '');
+    return $entry;
+}
+
+function parseM3uPlaylist(string $content): array
+{
+    $content = ltrim($content, "\xEF\xBB\xBF");
+    $entries = [];
+    $pending = null;
+
+    foreach (preg_split('/\R/', $content) ?: [] as $rawLine) {
+        $line = trim($rawLine);
+        if ($line === '') {
+            continue;
+        }
+
+        if (str_starts_with($line, '#EXTINF:')) {
+            if ($pending !== null && $pending['stream_url'] !== '') {
+                $entries[] = $pending;
+            }
+            $pending = parseExtinfLine($line);
+            continue;
+        }
+
+        if ($line[0] === '#') {
+            if ($pending === null) {
+                continue;
+            }
+            if (stripos($line, '#KODIPROP:') === 0) {
+                $pair = substr($line, strlen('#KODIPROP:'));
+                $separator = strpos($pair, '=');
+                if ($separator !== false) {
+                    $name = trim(substr($pair, 0, $separator));
+                    if ($name !== '') {
+                        $pending['properties'][$name] = trim(substr($pair, $separator + 1));
+                    }
+                }
+                continue;
+            }
+            if (stripos($line, '#EXTGRP:') === 0) {
+                $group = trim(substr($line, strlen('#EXTGRP:')));
+                if ($group !== '' && $pending['group_title'] === '') {
+                    $pending['group_title'] = $group;
+                }
+            }
+            continue;
+        }
+
+        if ($pending === null) {
+            $pending = ['name' => '', 'attributes' => [], 'group_title' => '', 'properties' => [], 'stream_url' => ''];
+        }
+        if ($pending['stream_url'] === '') {
+            $pending['stream_url'] = $line;
+            if ($pending['name'] === '') {
+                $pending['name'] = nameFromStreamUrl($line);
+            }
+            $entries[] = $pending;
+            $pending = null;
+        }
+    }
+    if ($pending !== null && $pending['stream_url'] !== '') {
+        $entries[] = $pending;
+    }
+
+    return $entries;
+}
+
+function drmFieldsFromProperties(array $properties): array
+{
+    $channel = [
+        'properties_json' => (string) json_encode((object) $properties),
+        'license_key_url' => '',
+        'drm_type' => '',
+        'drm_key_id' => '',
+        'drm_key' => '',
+        'drm_headers' => '',
+    ];
+    $settings = channelDrmSettings($channel);
+
+    $headers = '';
+    $licenseProperty = $properties['inputstream.adaptive.license_key'] ?? '';
+    if (is_string($licenseProperty)) {
+        $segments = explode('|', $licenseProperty);
+        if (isset($segments[1]) && $segments[1] !== '') {
+            parse_str($segments[1], $parsed);
+            $lines = [];
+            foreach ($parsed as $name => $value) {
+                if (is_string($name) && is_string($value) && $name !== '') {
+                    $lines[] = $name . ': ' . $value;
+                }
+            }
+            $headers = implode("\n", $lines);
+        }
+    }
+
+    return [
+        'type' => $settings['type'],
+        'license' => $settings['license'],
+        'key_id' => $settings['key_id'],
+        'key' => $settings['key'],
+        'headers' => $headers,
+    ];
+}
+
+function importPlaylist(PDO $db, string $content): array
+{
+    $entries = parseM3uPlaylist($content);
+    if ($entries === []) {
+        throw new RuntimeException('No channels found in the playlist. Expected an M3U playlist with #EXTINF entries.');
+    }
+
+    $insert = $db->prepare(
+        'INSERT INTO channels (source_id, name, tvg_id, tvg_name, group_title, tvg_language, tvg_type, '
+        . 'logo_url, stream_url, license_key_url, drm_type, drm_key_id, drm_key, drm_headers, '
+        . 'attributes_json, properties_json, url_fields_json, enabled, updated_at) '
+        . 'VALUES (:source_id, :name, :tvg_id, :tvg_name, :group_title, :language, :type, '
+        . ':logo_url, :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, :drm_headers, '
+        . ':attributes, :properties, :url_fields, :enabled, :updated_at) '
+        . 'ON CONFLICT(source_id) DO UPDATE SET '
+        . 'name = excluded.name, tvg_id = excluded.tvg_id, tvg_name = excluded.tvg_name, '
+        . 'group_title = excluded.group_title, tvg_language = excluded.tvg_language, tvg_type = excluded.tvg_type, '
+        . 'logo_url = excluded.logo_url, stream_url = excluded.stream_url, '
+        . 'license_key_url = excluded.license_key_url, drm_type = excluded.drm_type, '
+        . 'drm_key_id = excluded.drm_key_id, drm_key = excluded.drm_key, drm_headers = excluded.drm_headers, '
+        . 'attributes_json = excluded.attributes_json, properties_json = excluded.properties_json, '
+        . 'url_fields_json = excluded.url_fields_json, updated_at = excluded.updated_at'
+    );
+    $exists = $db->prepare('SELECT 1 FROM channels WHERE source_id = :source_id');
+
+    $added = 0;
+    $updated = 0;
+    $skipped = 0;
+    $now = gmdate('Y-m-d H:i:s');
+
+    $db->beginTransaction();
+    try {
+        foreach ($entries as $entry) {
+            $streamUrl = trim($entry['stream_url']);
+            $name = cleanGuideText($entry['name'] !== '' ? $entry['name'] : nameFromStreamUrl($streamUrl));
+            if ($streamUrl === '' || $name === '' || preg_match('#^[a-z][a-z0-9+.\-]*://#i', $streamUrl) !== 1) {
+                $skipped++;
+                continue;
+            }
+
+            $attributes = $entry['attributes'];
+            $properties = $entry['properties'];
+            $drm = drmFieldsFromProperties($properties);
+            $sourceId = 'm3u-' . sha1($name . "\0" . $streamUrl);
+
+            $exists->execute(['source_id' => $sourceId]);
+            $alreadyExists = (bool) $exists->fetchColumn();
+
+            $insert->execute([
+                'source_id' => $sourceId,
+                'name' => $name,
+                'tvg_id' => (string) ($attributes['tvg-id'] ?? ''),
+                'tvg_name' => (string) ($attributes['tvg-name'] ?? ''),
+                'group_title' => $entry['group_title'],
+                'language' => (string) ($attributes['tvg-language'] ?? ''),
+                'type' => (string) ($attributes['tvg-type'] ?? ''),
+                'logo_url' => (string) ($attributes['tvg-logo'] ?? ''),
+                'stream_url' => $streamUrl,
+                'license_key_url' => $drm['license'],
+                'drm_type' => $drm['type'],
+                'drm_key_id' => $drm['key_id'],
+                'drm_key' => $drm['key'],
+                'drm_headers' => $drm['headers'],
+                'attributes' => (string) (json_encode((object) $attributes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
+                'properties' => (string) (json_encode((object) $properties, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
+                'url_fields' => '{}',
+                'enabled' => 1,
+                'updated_at' => $now,
+            ]);
+            if ($alreadyExists) {
+                $updated++;
+            } else {
+                $added++;
+            }
+        }
+        $db->commit();
+    } catch (Throwable $error) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        throw $error;
+    }
+
+    if ($added === 0 && $updated === 0) {
+        throw new RuntimeException('No importable channels were found in the playlist.');
+    }
+
+    return ['added' => $added, 'updated' => $updated, 'skipped' => $skipped, 'total' => count($entries)];
 }
 
 function normalizeEpgUrl(string $url): string

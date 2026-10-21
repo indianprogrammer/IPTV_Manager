@@ -9,6 +9,37 @@ CLEAR_PID_FILE="$DATA_DIR/clear-server.pid"
 WEB_LOG_FILE="$DATA_DIR/web-server.log"
 PLAYLIST_LOG_FILE="$DATA_DIR/playlist-server.log"
 CLEAR_LOG_FILE="$DATA_DIR/clear-server.log"
+
+load_dotenv() {
+    local file=$1 line name value
+    [ -r "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case $line in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        name=${line%%=*}
+        value=${line#*=}
+        name=${name//[[:space:]]/}
+        case $name in
+            ''|*[!A-Za-z0-9_]*) continue ;;
+        esac
+        if [ "${#value}" -ge 2 ]; then
+            case $value in
+                \"*\") value=${value#\"}; value=${value%\"} ;;
+                \'*\') value=${value#\'}; value=${value%\'} ;;
+            esac
+        fi
+        if [ -z "${!name+x}" ]; then
+            export "$name=$value"
+        fi
+    done < "$file"
+}
+
+load_dotenv "$PROJECT_DIR/.env"
+
 HOST=${IPTV_HOST:-127.0.0.1}
 WEB_PORT=${IPTV_PORT:-8000}
 PLAYLIST_PORT=${IPTV_PLAYLIST_PORT:-8001}
@@ -17,7 +48,7 @@ PHP_BIN=${PHP_BIN:-$(command -v php || true)}
 
 usage() {
     echo "Usage: $0 {start|stop|restart|status}" >&2
-    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT clear=$CLEAR_PORT (override with IPTV_PORT, IPTV_PLAYLIST_PORT and IPTV_CLEAR_PORT)" >&2
+    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT clear=$CLEAR_PORT (set them in .env, or override with IPTV_PORT, IPTV_PLAYLIST_PORT and IPTV_CLEAR_PORT)" >&2
 }
 
 read_pid() {

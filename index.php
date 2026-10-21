@@ -264,6 +264,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } elseif ($action === 'epg_clear') {
             clearEpg($db);
             flash('Guide data cleared.');
+        } elseif ($action === 'playlist_import') {
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(300);
+            }
+            $uploaded = $_FILES['playlist_file'] ?? null;
+            if (is_array($uploaded) && (int) ($uploaded['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE) {
+                if ((int) $uploaded['error'] !== UPLOAD_ERR_OK) {
+                    throw new RuntimeException('The playlist upload failed (error code ' . (int) $uploaded['error'] . ').');
+                }
+                $temporary = (string) ($uploaded['tmp_name'] ?? '');
+                if ($temporary === '' || !is_uploaded_file($temporary)) {
+                    throw new RuntimeException('The uploaded playlist file is not readable.');
+                }
+                $size = (int) ($uploaded['size'] ?? 0);
+                if ($size <= 0 || $size > 50 * 1024 * 1024) {
+                    throw new RuntimeException('The uploaded playlist must be between 1 byte and 50 MB.');
+                }
+                $content = file_get_contents($temporary);
+                if ($content === false) {
+                    throw new RuntimeException('Unable to read the uploaded playlist file.');
+                }
+                $content = maybeDecompressGzip($content);
+                $sourceLabel = 'file "' . (string) ($uploaded['name'] ?? 'playlist') . '"';
+            } else {
+                $postedUrl = trim((string) ($_POST['playlist_url'] ?? ''));
+                if ($postedUrl === '') {
+                    throw new RuntimeException('Choose a playlist file to upload or enter a playlist URL.');
+                }
+                $content = downloadPlaylist($postedUrl);
+                $sourceLabel = 'URL ' . $postedUrl;
+            }
+            $result = importPlaylist($db, $content);
+            flash(sprintf(
+                'Playlist imported from %s: %d added, %d updated, %d skipped.',
+                $sourceLabel,
+                $result['added'],
+                $result['updated'],
+                $result['skipped']
+            ));
         } else {
             throw new RuntimeException('Unknown action.');
         }
@@ -278,6 +317,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         'page' => $_GET['page'] ?? null,
         'categories' => $_GET['categories'] ?? null,
         'add' => $_GET['add'] ?? null,
+        'import' => $_GET['import'] ?? null,
         'guide' => $_GET['guide'] ?? null,
         'date' => $_GET['date'] ?? null,
         'guide_category' => $_GET['guide_category'] ?? null,
@@ -476,6 +516,7 @@ function statusButton(int $id, bool $enabled): string
         static fn (): int => (int) $db->query("SELECT COUNT(*) FROM channels WHERE group_title = ''")->fetchColumn()
     );
     $addChannel = isset($_GET['add']);
+    $importPlaylist = isset($_GET['import']);
     if ($guideMode) {
         $epgUrl = metaValue($db, 'epg_url');
         $epgLastImport = (int) metaValue($db, 'epg_last_import', '0');
@@ -656,6 +697,7 @@ function statusButton(int $id, bool $enabled): string
             <span class="admin-label"><span class="online-dot"></span><?= h((string) $_SESSION['admin']) ?></span>
             <a class="button text-button" href="index.php?guide=1"<?= $guideMode ? ' aria-current="page"' : '' ?>>TV Guide</a>
             <a class="button text-button" href="index.php?add=1"<?= $addChannel ? ' aria-current="page"' : '' ?>>Add channel</a>
+            <a class="button text-button" href="index.php?import=1"<?= $importPlaylist ? ' aria-current="page"' : '' ?>>Import playlist</a>
             <a class="button text-button categories-link" href="index.php?categories=1"<?= $manageCategories ? ' aria-current="page"' : '' ?>>Manage categories</a>
             <a class="button text-button" href="<?= h($playlistUrl) ?>" download="iptv-manager.m3u">Download M3U</a>
             <a class="button text-button" href="<?= h($clearUrl) ?>" download="iptv-manager-clear.m3u">Clear M3U</a>
@@ -839,6 +881,30 @@ function statusButton(int $id, bool $enabled): string
                         <option value="<?= h((string) $item) ?>"></option>
                     <?php endforeach; ?>
                 </datalist>
+            </section>
+        <?php elseif ($importPlaylist): ?>
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow">IMPORT PLAYLIST</p>
+                        <h2>Import M3U playlist</h2>
+                        <p class="muted">Upload an M3U/M3U8 file or enter a playlist URL. Channels with the same name and stream URL are updated in place; channels you disabled stay disabled. #KODIPROP DRM settings are mapped to the dedicated DRM fields automatically.</p>
+                    </div>
+                    <a class="button secondary" href="index.php">Back to channels</a>
+                </div>
+                <form method="post" action="index.php?import=1" enctype="multipart/form-data" class="channel-edit-form">
+                    <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                    <input type="hidden" name="action" value="playlist_import">
+                    <div class="form-grid">
+                        <label class="span-2">Playlist file<input type="file" name="playlist_file" accept=".m3u,.m3u8,.txt"></label>
+                        <label class="span-2">Playlist URL<input type="url" name="playlist_url" placeholder="https://example.com/playlist.m3u"></label>
+                    </div>
+                    <p class="muted">Fill in the file or the URL — if both are given, the file is used. Gzip-compressed playlists are supported.</p>
+                    <div class="form-actions">
+                        <button class="button primary" type="submit">Import playlist</button>
+                        <a class="button secondary" href="index.php">Cancel</a>
+                    </div>
+                </form>
             </section>
         <?php elseif ($editChannel): ?>
             <section class="form-card">

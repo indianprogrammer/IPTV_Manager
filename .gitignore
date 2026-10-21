@@ -5,6 +5,8 @@
 /data/*.pid
 /data/*.log
 
+.env
+
 .DS_Store
 *.swp
 *~

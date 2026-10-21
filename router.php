@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/lib.php';
+
 $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $requestQuery = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_QUERY);
 $playlistPort = (int) (getenv('IPTV_PLAYLIST_PORT') ?: 8001);

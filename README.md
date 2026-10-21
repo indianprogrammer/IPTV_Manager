@@ -9,7 +9,12 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 **Channel library**
 - Compact channel table with enable/disable status dot, logo, TVG ID, category, language, type, and URL columns
 - Search and category filtering with pagination
-- Add / edit / delete channels manually (no upstream sync required)
+- Add / edit / delete channels manually, or import an existing M3U playlist
+
+**Playlist import**
+- Import channels from an M3U/M3U8 playlist — uploaded as a file or fetched from a URL (gzip supported)
+- Idempotent: channels with the same name and stream URL are updated in place; disabled channels stay disabled
+- `#KODIPROP` DRM settings (`license_type` / `license_key`, including license request headers) are mapped to the dedicated DRM fields
 - Inline SVG icon actions for play, edit, and delete
 - Category management: rename to merge, delete empty categories
 
@@ -66,6 +71,7 @@ php -m | grep -i pdo_sqlite
 ## Quick start
 
 ```sh
+cp .env.example .env   # optional — defaults to ports 8000/8001/8002 on 127.0.0.1
 ./iptv-manager start
 ```
 
@@ -88,20 +94,15 @@ Three servers are started:
 You can also run the servers directly:
 
 ```sh
-IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 IPTV_CLEAR_PORT=8002 php -S 127.0.0.1:8000 -t . router.php
-IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 IPTV_CLEAR_PORT=8002 php -S 127.0.0.1:8001 -t . router.php
-IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 IPTV_CLEAR_PORT=8002 php -S 127.0.0.1:8002 -t . router.php
+set -a; . ./.env; set +a
+php -S "$IPTV_HOST:$IPTV_PORT" -t . router.php
+php -S "$IPTV_HOST:$IPTV_PLAYLIST_PORT" -t . router.php
+php -S "$IPTV_HOST:$IPTV_CLEAR_PORT" -t . router.php
 ```
 
-### Clear feed
-
-The clear feed exists for players that cannot handle DRM. It serves the same M3U format as the playlist feed, but skips any channel with DRM configured:
-
-- DRM is detected from the dedicated `drm_type`, license URL and ClearKey fields, and from `inputstream.adaptive.license_type` / `inputstream.adaptive.license_key` KODIPROP entries.
-- Channels that pass the filter keep their original `stream_url` and KODIPROP lines — the feed is only a filter, it does not relay or rewrite streams.
-- Detection is configuration-based, so a URL that is encrypted upstream but not marked as DRM in the manager cannot be filtered out.
-
 ### Configuration
+
+Ports and bind address are read from a `.env` file in the project root (see `.env.example`). Real environment variables always override `.env` values.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -111,11 +112,28 @@ The clear feed exists for players that cannot handle DRM. It serves the same M3U
 | `IPTV_CLEAR_PORT` | `8002` | Clear-only feed port |
 | `PHP_BIN` | `php` | PHP binary used by the launcher |
 
-Example: expose to a trusted LAN on other ports:
+Example: expose to a trusted LAN on other ports — edit `.env`:
+
+```ini
+IPTV_HOST=0.0.0.0
+IPTV_PORT=8080
+IPTV_PLAYLIST_PORT=8081
+IPTV_CLEAR_PORT=8082
+```
+
+or override for a single run:
 
 ```sh
 IPTV_HOST=0.0.0.0 IPTV_PORT=8080 IPTV_PLAYLIST_PORT=8081 IPTV_CLEAR_PORT=8082 ./iptv-manager start
 ```
+
+### Clear feed
+
+The clear feed exists for players that cannot handle DRM. It serves the same M3U format as the playlist feed, but skips any channel with DRM configured:
+
+- DRM is detected from the dedicated `drm_type`, license URL and ClearKey fields, and from `inputstream.adaptive.license_type` / `inputstream.adaptive.license_key` KODIPROP entries.
+- Channels that pass the filter keep their original `stream_url` and KODIPROP lines — the feed is only a filter, it does not relay or rewrite streams.
+- Detection is configuration-based, so a URL that is encrypted upstream but not marked as DRM in the manager cannot be filtered out.
 
 ## Data and storage
 
@@ -135,18 +153,19 @@ Everything lives in a single SQLite file at `data/iptv.sqlite`. On first run the
 
 ```
 index.php        Web UI: routes, actions, views, preview player
-lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers
+lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers, .env loader
 playlist.php     Cached M3U endpoint (ETag / 304), reused for the full and clear feeds
 playlist-clear.php Clear-only M3U endpoint (no DRM-configured channels)
 router.php       Per-port routing and style.css cache headers
 style.css        UI styling
 iptv-manager     start / stop / restart / status launcher
+.env.example     Configuration template (copy to .env)
 docs/screenshots README screenshots
 data/            SQLite DB, cache, logs (git-ignored)
 ```
 
 ## Notes
 
-- The manager does not fetch or sync an upstream playlist; channels are managed locally.
+- The manager does not auto-sync an upstream playlist; channels are managed locally or imported on demand.
 - Guide times are displayed in the server's timezone.
 - The Shaka Player library is fetched from a CDN on first preview; if the CDN is unreachable, native formats (MP4/WebM/Ogg) still play.
