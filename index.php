@@ -1030,7 +1030,6 @@ function logDetailFields(array $entry): array
     <header class="topbar">
         <a class="brand" href="index.php"><span class="brand-mark small">▶</span><span>IPTV <b>Manager</b></span></a>
         <div class="topbar-right">
-            <span class="admin-label"><span class="online-dot"></span><?= h((string) $_SESSION['admin']) ?></span>
             <a class="button text-button" href="index.php"<?= (!$guideMode && !$logMode && !$securityMode && !$addChannel && !$importPlaylist && !$manageCategories && !$editChannel) ? ' aria-current="page"' : '' ?>>Dashboard</a>
             <a class="button text-button" href="index.php?guide=1"<?= $guideMode ? ' aria-current="page"' : '' ?>>TV Guide</a>
             <a class="button text-button" href="index.php?log=1"<?= $logMode ? ' aria-current="page"' : '' ?>>Live log</a>
@@ -1045,11 +1044,30 @@ function logDetailFields(array $entry): array
                 <input type="hidden" name="action" value="purge_cache">
                 <button class="button text-button" type="submit">Purge cache</button>
             </form>
-            <form method="post">
-                <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
-                <input type="hidden" name="action" value="logout">
-                <button class="button text-button" type="submit">Sign out</button>
-            </form>
+            <div class="user-menu">
+                <button class="user-menu-toggle" type="button" id="user-menu-toggle" aria-haspopup="true" aria-expanded="false">
+                    <span class="user-avatar" aria-hidden="true"><?= h(strtoupper(substr((string) $_SESSION['admin'], 0, 1))) ?></span>
+                    <span class="user-name"><?= h((string) $_SESSION['admin']) ?></span>
+                    <svg class="user-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6"/></svg>
+                </button>
+                <div class="user-menu-panel" id="user-menu-panel" hidden>
+                    <div class="user-menu-head">
+                        <span class="user-avatar large" aria-hidden="true"><?= h(strtoupper(substr((string) $_SESSION['admin'], 0, 1))) ?></span>
+                        <div>
+                            <strong><?= h((string) $_SESSION['admin']) ?></strong>
+                            <small><span class="online-dot"></span>Signed in</small>
+                        </div>
+                    </div>
+                    <form method="post" class="user-menu-form">
+                        <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                        <input type="hidden" name="action" value="logout">
+                        <button class="user-menu-item" type="submit">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
+                            Sign out
+                        </button>
+                    </form>
+                </div>
+            </div>
         </div>
     </header>
     <main class="page">
@@ -2220,6 +2238,36 @@ function logDetailFields(array $entry): array
                 }
                 playStream(data, requestToken);
             });
+        });
+    })();
+    </script>
+    <script>
+    (() => {
+        const toggle = document.getElementById('user-menu-toggle');
+        const panel = document.getElementById('user-menu-panel');
+        if (!toggle || !panel) {
+            return;
+        }
+        const menu = toggle.closest('.user-menu');
+        const close = () => {
+            panel.hidden = true;
+            toggle.setAttribute('aria-expanded', 'false');
+        };
+        toggle.addEventListener('click', (event) => {
+            event.stopPropagation();
+            const open = panel.hidden;
+            panel.hidden = !open;
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+        document.addEventListener('click', (event) => {
+            if (menu && !menu.contains(event.target)) {
+                close();
+            }
+        });
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                close();
+            }
         });
     })();
     </script>
