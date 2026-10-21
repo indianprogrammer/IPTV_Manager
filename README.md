@@ -72,38 +72,49 @@ php -m | grep -i pdo_sqlite
 Then open <http://127.0.0.1:8000> and sign in with **admin / admin**.
 
 ```sh
-./iptv-manager status     # check both servers
+./iptv-manager status     # check all servers
 ./iptv-manager restart    # apply code changes
-./iptv-manager stop       # stop both servers
+./iptv-manager stop       # stop all servers
 ```
 
-Two servers are started:
+Three servers are started:
 
 | Service | Default URL | Purpose |
 |---|---|---|
 | Web UI | `http://127.0.0.1:8000` | Administration interface |
-| Playlist | `http://127.0.0.1:8001` | Cached M3U feed (`/` only; other paths redirect) |
+| Playlist | `http://127.0.0.1:8001` | Cached M3U feed with every channel (`/` only; other paths redirect) |
+| Clear | `http://127.0.0.1:8002` | Cached M3U feed with only channels that have no DRM configured |
 
 You can also run the servers directly:
 
 ```sh
-IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 php -S 127.0.0.1:8000 -t . router.php
-IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 php -S 127.0.0.1:8001 -t . router.php
+IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 IPTV_CLEAR_PORT=8002 php -S 127.0.0.1:8000 -t . router.php
+IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 IPTV_CLEAR_PORT=8002 php -S 127.0.0.1:8001 -t . router.php
+IPTV_PORT=8000 IPTV_PLAYLIST_PORT=8001 IPTV_CLEAR_PORT=8002 php -S 127.0.0.1:8002 -t . router.php
 ```
+
+### Clear feed
+
+The clear feed exists for players that cannot handle DRM. It serves the same M3U format as the playlist feed, but skips any channel with DRM configured:
+
+- DRM is detected from the dedicated `drm_type`, license URL and ClearKey fields, and from `inputstream.adaptive.license_type` / `inputstream.adaptive.license_key` KODIPROP entries.
+- Channels that pass the filter keep their original `stream_url` and KODIPROP lines — the feed is only a filter, it does not relay or rewrite streams.
+- Detection is configuration-based, so a URL that is encrypted upstream but not marked as DRM in the manager cannot be filtered out.
 
 ### Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `IPTV_HOST` | `127.0.0.1` | Bind address for both servers |
+| `IPTV_HOST` | `127.0.0.1` | Bind address for all servers |
 | `IPTV_PORT` | `8000` | Web UI port |
 | `IPTV_PLAYLIST_PORT` | `8001` | Playlist feed port |
+| `IPTV_CLEAR_PORT` | `8002` | Clear-only feed port |
 | `PHP_BIN` | `php` | PHP binary used by the launcher |
 
 Example: expose to a trusted LAN on other ports:
 
 ```sh
-IPTV_HOST=0.0.0.0 IPTV_PORT=8080 IPTV_PLAYLIST_PORT=8081 ./iptv-manager start
+IPTV_HOST=0.0.0.0 IPTV_PORT=8080 IPTV_PLAYLIST_PORT=8081 IPTV_CLEAR_PORT=8082 ./iptv-manager start
 ```
 
 ## Data and storage
@@ -125,7 +136,8 @@ Everything lives in a single SQLite file at `data/iptv.sqlite`. On first run the
 ```
 index.php        Web UI: routes, actions, views, preview player
 lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers
-playlist.php     Cached M3U endpoint (ETag / 304)
+playlist.php     Cached M3U endpoint (ETag / 304), reused for the full and clear feeds
+playlist-clear.php Clear-only M3U endpoint (no DRM-configured channels)
 router.php       Per-port routing and style.css cache headers
 style.css        UI styling
 iptv-manager     start / stop / restart / status launcher

@@ -5,16 +5,19 @@ PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DATA_DIR="$PROJECT_DIR/data"
 WEB_PID_FILE="$DATA_DIR/web-server.pid"
 PLAYLIST_PID_FILE="$DATA_DIR/playlist-server.pid"
+CLEAR_PID_FILE="$DATA_DIR/clear-server.pid"
 WEB_LOG_FILE="$DATA_DIR/web-server.log"
 PLAYLIST_LOG_FILE="$DATA_DIR/playlist-server.log"
+CLEAR_LOG_FILE="$DATA_DIR/clear-server.log"
 HOST=${IPTV_HOST:-127.0.0.1}
 WEB_PORT=${IPTV_PORT:-8000}
 PLAYLIST_PORT=${IPTV_PLAYLIST_PORT:-8001}
+CLEAR_PORT=${IPTV_CLEAR_PORT:-8002}
 PHP_BIN=${PHP_BIN:-$(command -v php || true)}
 
 usage() {
     echo "Usage: $0 {start|stop|restart|status}" >&2
-    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT (override with IPTV_PORT and IPTV_PLAYLIST_PORT)" >&2
+    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT clear=$CLEAR_PORT (override with IPTV_PORT, IPTV_PLAYLIST_PORT and IPTV_CLEAR_PORT)" >&2
 }
 
 read_pid() {
@@ -171,8 +174,8 @@ start_all() {
         echo "Error: PHP must have the PDO SQLite extension enabled." >&2
         return 1
     fi
-    if [ "$WEB_PORT" = "$PLAYLIST_PORT" ]; then
-        echo "Error: web and playlist ports must be different." >&2
+    if [ "$WEB_PORT" = "$PLAYLIST_PORT" ] || [ "$WEB_PORT" = "$CLEAR_PORT" ] || [ "$PLAYLIST_PORT" = "$CLEAR_PORT" ]; then
+        echo "Error: web, playlist and clear ports must be different." >&2
         return 1
     fi
     mkdir -p "$DATA_DIR" || {
@@ -185,18 +188,26 @@ start_all() {
         stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
         return 1
     fi
+    if ! start_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE" "$CLEAR_LOG_FILE"; then
+        stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
+        stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
+        return 1
+    fi
 }
 
 case ${1:-} in
     start) start_all ;;
     stop)
+        stop_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE"
+        clear_status=$?
         stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
         playlist_status=$?
         stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
         web_status=$?
-        [ "$playlist_status" -eq 0 ] && [ "$web_status" -eq 0 ]
+        [ "$clear_status" -eq 0 ] && [ "$playlist_status" -eq 0 ] && [ "$web_status" -eq 0 ]
         ;;
     restart)
+        stop_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE" || exit $?
         stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE" || exit $?
         stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE" || exit $?
         start_all
@@ -206,9 +217,11 @@ case ${1:-} in
         web_status=$?
         status_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
         playlist_status=$?
-        if [ "$web_status" -eq 0 ] && [ "$playlist_status" -eq 0 ]; then
+        status_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE"
+        clear_status=$?
+        if [ "$web_status" -eq 0 ] && [ "$playlist_status" -eq 0 ] && [ "$clear_status" -eq 0 ]; then
             exit 0
-        elif [ "$web_status" -eq 3 ] && [ "$playlist_status" -eq 3 ]; then
+        elif [ "$web_status" -eq 3 ] && [ "$playlist_status" -eq 3 ] && [ "$clear_status" -eq 3 ]; then
             exit 3
         else
             exit 1

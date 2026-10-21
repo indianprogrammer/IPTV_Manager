@@ -626,6 +626,8 @@ function statusButton(int $id, bool $enabled): string
     }
     $playlistPort = (int) (getenv('IPTV_PLAYLIST_PORT') ?: 8001);
     $playlistUrl = 'http://' . $playlistHost . ':' . $playlistPort . '/';
+    $clearPort = (int) (getenv('IPTV_CLEAR_PORT') ?: 8002);
+    $clearUrl = 'http://' . $playlistHost . ':' . $clearPort . '/';
     $baseQuery = array_filter(['q' => $search, 'category' => $category], static fn ($value): bool => $value !== '');
     $listParams = $baseQuery;
     if ($page > 1) {
@@ -656,6 +658,7 @@ function statusButton(int $id, bool $enabled): string
             <a class="button text-button" href="index.php?add=1"<?= $addChannel ? ' aria-current="page"' : '' ?>>Add channel</a>
             <a class="button text-button categories-link" href="index.php?categories=1"<?= $manageCategories ? ' aria-current="page"' : '' ?>>Manage categories</a>
             <a class="button text-button" href="<?= h($playlistUrl) ?>" download="iptv-manager.m3u">Download M3U</a>
+            <a class="button text-button" href="<?= h($clearUrl) ?>" download="iptv-manager-clear.m3u">Clear M3U</a>
             <form method="post" class="purge-cache-form">
                 <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
                 <input type="hidden" name="action" value="purge_cache">

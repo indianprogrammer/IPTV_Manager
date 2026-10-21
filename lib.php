@@ -288,6 +288,15 @@ function channelDrmSettings(array $channel): array
     return ['type' => $type, 'license' => $license, 'key_id' => $keyId, 'key' => $key];
 }
 
+function channelHasDrm(array $channel): bool
+{
+    $settings = channelDrmSettings($channel);
+    return $settings['type'] !== ''
+        || $settings['license'] !== ''
+        || $settings['key_id'] !== ''
+        || $settings['key'] !== '';
+}
+
 function drmPlaylistProperties(array $channel): array
 {
     $type = strtolower(trim((string) ($channel['drm_type'] ?? '')));
@@ -323,7 +332,7 @@ function drmPlaylistProperties(array $channel): array
     return $properties;
 }
 
-function buildPlaylist(PDO $db): string
+function buildPlaylist(PDO $db, bool $clearOnly = false): string
 {
     $epgUrl = $db->query("SELECT value FROM app_meta WHERE name = 'epg_url'")->fetchColumn();
     $channels = $db->query(
@@ -331,6 +340,10 @@ function buildPlaylist(PDO $db): string
         . 'license_key_url, drm_type, drm_key_id, drm_key, drm_headers '
         . 'FROM channels WHERE enabled = 1 ORDER BY group_title COLLATE NOCASE, name COLLATE NOCASE'
     )->fetchAll();
+
+    if ($clearOnly) {
+        $channels = array_values(array_filter($channels, static fn (array $channel): bool => !channelHasDrm($channel)));
+    }
 
     $headerAttributes = [];
     if (is_string($epgUrl) && $epgUrl !== '') {
@@ -371,16 +384,16 @@ function buildPlaylist(PDO $db): string
     return $output;
 }
 
-function cachedPlaylist(PDO $db): array
+function cachedPlaylist(PDO $db, bool $clearOnly = false): array
 {
-    $signature = databaseSignature() . ':' . cacheVersion($db);
+    $signature = databaseSignature() . ':' . cacheVersion($db) . ($clearOnly ? ':clear' : ':all');
     $contentFile = null;
     $metaFile = null;
 
     try {
         $directory = cacheDirectory();
-        $contentFile = $directory . '/playlist.m3u';
-        $metaFile = $directory . '/playlist.meta.json';
+        $contentFile = $directory . '/' . ($clearOnly ? 'playlist-clear.m3u' : 'playlist.m3u');
+        $metaFile = $directory . '/' . ($clearOnly ? 'playlist-clear.meta.json' : 'playlist.meta.json');
         if (is_file($contentFile) && is_file($metaFile)) {
             $meta = json_decode((string) file_get_contents($metaFile), true);
             $content = file_get_contents($contentFile);
@@ -396,7 +409,7 @@ function cachedPlaylist(PDO $db): array
         // Fall through and rebuild when the cache is unavailable.
     }
 
-    $content = buildPlaylist($db);
+    $content = buildPlaylist($db, $clearOnly);
     $generatedAt = time();
 
     if ($contentFile !== null && $metaFile !== null) {

@@ -6,13 +6,15 @@ require_once __DIR__ . '/lib.php';
 $db = database();
 initializeDatabase($db);
 
-$playlist = cachedPlaylist($db);
+$clearOnly = $GLOBALS['playlistClearOnly'] ?? false;
+
+$playlist = cachedPlaylist($db, $clearOnly);
 $content = $playlist['content'];
 $generatedAt = (int) $playlist['generated_at'];
 $etag = '"' . sha1($content) . '"';
 
 header('Content-Type: audio/x-mpegurl; charset=utf-8');
-header('Content-Disposition: inline; filename="iptv-manager.m3u"');
+header('Content-Disposition: inline; filename="' . ($clearOnly ? 'iptv-manager-clear.m3u' : 'iptv-manager.m3u') . '"');
 header('Cache-Control: public, max-age=60, must-revalidate');
 header('ETag: ' . $etag);
 header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $generatedAt) . ' GMT');
