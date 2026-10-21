@@ -1423,3 +1423,340 @@ function clearEpg(PDO $db): int
     setMetaValue($db, 'epg_channel_count', '0');
     return $removed;
 }
+
+/* -------------------------------------------------------------------------
+ * Request log (live log) — one JSON line per request, tailed by the UI
+ * ---------------------------------------------------------------------- */
+
+function requestLogPath(): string
+{
+    return __DIR__ . '/data/requests.log';
+}
+
+function envFlag(string $name, bool $default = false): bool
+{
+    $value = getenv($name);
+    if ($value === false) {
+        return $default;
+    }
+    $value = strtolower(trim($value));
+    if ($value === '') {
+        return $default;
+    }
+    return in_array($value, ['1', 'on', 'true', 'yes'], true);
+}
+
+function metaFlag(PDO $db, string $name, bool $default): bool
+{
+    $statement = $db->prepare('SELECT value FROM app_meta WHERE name = :name');
+    $statement->execute(['name' => $name]);
+    $value = $statement->fetchColumn();
+    if (!is_string($value) || trim($value) === '') {
+        return $default;
+    }
+    return in_array(strtolower(trim($value)), ['1', 'on', 'true', 'yes'], true);
+}
+
+function requestDebugEnabled(): bool
+{
+    $default = envFlag('IPTV_DEBUG', false);
+    try {
+        return metaFlag(database(), 'debug_mode', $default);
+    } catch (Throwable) {
+        return $default;
+    }
+}
+
+function setRequestDebugMode(bool $enabled): void
+{
+    setMetaValue(database(), 'debug_mode', $enabled ? '1' : '0');
+}
+
+function rotateRequestLog(string $path, int $maxBytes = 1048576, int $keepLines = 400): void
+{
+    clearstatcache(true, $path);
+    if (!is_file($path) || filesize($path) < $maxBytes) {
+        return;
+    }
+    $lines = file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return;
+    }
+    $kept = array_slice($lines, -$keepLines);
+    @file_put_contents($path, ($kept === [] ? '' : implode("\n", $kept) . "\n"), LOCK_EX);
+}
+
+function appendRequestLog(array $entry): void
+{
+    try {
+        $path = requestLogPath();
+        $directory = dirname($path);
+        if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
+            return;
+        }
+        rotateRequestLog($path);
+        $entry += ['t' => date('c'), 'service' => '', 'method' => '', 'uri' => '', 'ip' => '', 'ua' => '', 'status' => 0, 'ms' => 0];
+        $line = json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($line !== false) {
+            @file_put_contents($path, $line . "\n", FILE_APPEND | LOCK_EX);
+        }
+    } catch (Throwable) {
+        // Logging is best-effort and must never break a request.
+    }
+}
+
+function readRequestLog(int $limit = 200): array
+{
+    try {
+        $path = requestLogPath();
+        if (!is_file($path)) {
+            return [];
+        }
+        $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) {
+            return [];
+        }
+        $entries = [];
+        foreach (array_slice($lines, -$limit) as $line) {
+            $decoded = json_decode($line, true);
+            if (is_array($decoded)) {
+                $entries[] = $decoded;
+            }
+        }
+        return array_reverse($entries);
+    } catch (Throwable) {
+        return [];
+    }
+}
+
+function clearRequestLog(): void
+{
+    $path = requestLogPath();
+    if (is_file($path)) {
+        @unlink($path);
+    }
+}
+
+function requestNote(string $note): void
+{
+    $GLOBALS['iptv_request_note'] = $note;
+}
+
+function requestLogIgnored(string $uri): bool
+{
+    $path = (string) (parse_url($uri, PHP_URL_PATH) ?? '');
+    if ($path !== '/index.php' && $path !== '/' && $path !== '') {
+        return false;
+    }
+    $query = (string) (parse_url($uri, PHP_URL_QUERY) ?? '');
+    if ($query === '') {
+        return false;
+    }
+    parse_str($query, $params);
+    return isset($params['tail']);
+}
+
+function requestHeaders(): array
+{
+    $headers = [];
+    foreach ($_SERVER as $name => $value) {
+        if (!is_string($value) || !str_starts_with($name, 'HTTP_')) {
+            continue;
+        }
+        $header = str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($name, 5)))));
+        $headers[$header] = $value;
+    }
+    return $headers;
+}
+
+function startRequestLogging(string $service): void
+{
+    $started = microtime(true);
+    register_shutdown_function(static function () use ($service, $started): void {
+        $note = (string) ($GLOBALS['iptv_request_note'] ?? '');
+        if (!requestDebugEnabled() && $note === '') {
+            return;
+        }
+        if (requestLogIgnored((string) ($_SERVER['REQUEST_URI'] ?? ''))) {
+            return;
+        }
+        $status = http_response_code();
+        appendRequestLog([
+            't' => date('c'),
+            'service' => $service,
+            'ip' => (string) ($_SERVER['REMOTE_ADDR'] ?? ''),
+            'method' => (string) ($_SERVER['REQUEST_METHOD'] ?? ''),
+            'uri' => (string) ($_SERVER['REQUEST_URI'] ?? '/'),
+            'ua' => (string) ($_SERVER['HTTP_USER_AGENT'] ?? ''),
+            'proto' => (string) ($_SERVER['SERVER_PROTOCOL'] ?? ''),
+            'host' => (string) ($_SERVER['HTTP_HOST'] ?? ''),
+            'referer' => (string) ($_SERVER['HTTP_REFERER'] ?? ''),
+            'headers' => requestHeaders(),
+            'status' => is_int($status) && $status > 0 ? $status : 200,
+            'ms' => round((microtime(true) - $started) * 1000, 1),
+            'note' => $note,
+        ]);
+    });
+}
+
+/* -------------------------------------------------------------------------
+ * User-agent security — ordered rules deciding what a client receives
+ * ---------------------------------------------------------------------- */
+
+function userAgentRuleActions(): array
+{
+    return [
+        'serve' => "Allow — serve this server's playlist",
+        'playlist' => 'Allow — send the full playlist',
+        'clear' => 'Allow — send the clear playlist',
+        'block' => 'Deny — respond with 404 Not Found',
+    ];
+}
+
+function userAgentRules(): array
+{
+    try {
+        $raw = metaValue(database(), 'ua_rules', '');
+    } catch (Throwable) {
+        return [];
+    }
+    if ($raw === '') {
+        return [];
+    }
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        return [];
+    }
+    $rules = [];
+    foreach ($decoded as $rule) {
+        if (!is_array($rule)) {
+            continue;
+        }
+        $pattern = trim((string) ($rule['pattern'] ?? ''));
+        if ($pattern === '') {
+            continue;
+        }
+        $action = (string) ($rule['action'] ?? 'serve');
+        if (!array_key_exists($action, userAgentRuleActions())) {
+            $action = 'serve';
+        }
+        $rules[] = [
+            'id' => (string) ($rule['id'] ?? ''),
+            'pattern' => $pattern,
+            'action' => $action,
+            'note' => (string) ($rule['note'] ?? ''),
+            'enabled' => (bool) ($rule['enabled'] ?? true),
+        ];
+    }
+    return $rules;
+}
+
+function saveUserAgentRules(array $rules): void
+{
+    $encoded = json_encode(array_values($rules), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($encoded === false) {
+        throw new RuntimeException('Unable to encode the user-agent rules.');
+    }
+    setMetaValue(database(), 'ua_rules', $encoded);
+}
+
+function userAgentEnforced(): bool
+{
+    $default = envFlag('IPTV_UA_ENFORCE', true);
+    try {
+        return metaFlag(database(), 'ua_enforce', $default);
+    } catch (Throwable) {
+        return $default;
+    }
+}
+
+function setUserAgentEnforced(bool $enabled): void
+{
+    setMetaValue(database(), 'ua_enforce', $enabled ? '1' : '0');
+}
+
+function userAgentPatternRegex(string $pattern): ?string
+{
+    $first = $pattern === '' ? '' : $pattern[0];
+    if ($first === '' || strpbrk($first, '/#~!') === false) {
+        return null;
+    }
+    $last = strrpos($pattern, $first);
+    if ($last === false || $last === 0) {
+        return null;
+    }
+    $regex = substr($pattern, 0, $last + 1);
+    $modifiers = substr($pattern, $last + 1);
+    if (!str_contains($modifiers, 'i')) {
+        $modifiers .= 'i';
+    }
+    return $regex . $modifiers;
+}
+
+function userAgentPatternMatches(string $pattern, string $userAgent): bool
+{
+    $regex = userAgentPatternRegex($pattern);
+    if ($regex !== null) {
+        return @preg_match($regex, $userAgent) === 1;
+    }
+
+    if ($pattern === '') {
+        return false;
+    }
+
+    if (str_contains($pattern, '*') || str_contains($pattern, '?')) {
+        $quoted = preg_quote($pattern, '/');
+        $quoted = str_replace(['\*', '\?'], ['.*', '.'], $quoted);
+        return @preg_match('/' . $quoted . '/i', $userAgent) === 1;
+    }
+
+    return stripos($userAgent, $pattern) !== false;
+}
+
+function validateUserAgentPattern(string $pattern): void
+{
+    if ($pattern === '') {
+        throw new RuntimeException('User-agent pattern is required.');
+    }
+    if (strlen($pattern) > 500) {
+        throw new RuntimeException('User-agent pattern must be 500 characters or fewer.');
+    }
+    $regex = userAgentPatternRegex($pattern);
+    if ($regex !== null && @preg_match($regex, '') === false) {
+        throw new RuntimeException('Invalid regular expression: ' . preg_last_error_msg());
+    }
+}
+
+function matchUserAgent(string $userAgent, array $rules): ?array
+{
+    foreach ($rules as $rule) {
+        if (!($rule['enabled'] ?? true)) {
+            continue;
+        }
+        if (userAgentPatternMatches((string) ($rule['pattern'] ?? ''), $userAgent)) {
+            return $rule;
+        }
+    }
+    return null;
+}
+
+function evaluateUserAgentRules(string $userAgent, array $rules): array
+{
+    $rule = matchUserAgent($userAgent, $rules);
+    if ($rule === null) {
+        return ['action' => 'block', 'rule' => null];
+    }
+    return ['action' => (string) $rule['action'], 'rule' => $rule];
+}
+
+function evaluateUserAgent(string $userAgent): array
+{
+    try {
+        if (!userAgentEnforced()) {
+            return ['action' => 'serve', 'rule' => null];
+        }
+        return evaluateUserAgentRules($userAgent, userAgentRules());
+    } catch (Throwable) {
+        return ['action' => 'block', 'rule' => null];
+    }
+}

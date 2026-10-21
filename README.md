@@ -28,8 +28,6 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 
 **TV guide (XMLTV)**
 
-![TV guide](docs/screenshots/tv-guide.png)
-
 - Synchronous XMLTV import over HTTP/HTTPS with gzip support and size caps
 - Matches programmes to channels by TVG ID, then by normalized display name
 - Transactional imports: a failed or empty source never wipes existing guide data
@@ -41,6 +39,18 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 - Dedicated fields for license URL, ClearKey key ID + key, and license request headers
 - Written into the generated playlist as `#KODIPROP:inputstream.adaptive.license_type` and `#KODIPROP:inputstream.adaptive.license_key` (license URL plus header segment for Kodi)
 - Dedicated DRM fields override matching KODIPROP keys; feeds configured only through the KODIPROP textarea keep working unchanged
+
+**Live log (debug mode)**
+- Toggle debug mode from the **Live log** page; while on, every request to the web, playlist and clear servers is recorded
+- One JSON line per request in `data/requests.log` — timestamp, server, client IP, user agent, method, path, status, duration, and any user-agent security decision
+- The page polls the log every two seconds and renders new lines live; the file auto-rotates at 1 MB (last 400 lines kept)
+
+**User-agent security**
+- **Deny by default**: with enforcement on, both the playlist and clear feeds return **404 Not Found** to every client unless its `User-Agent` matches an allow rule
+- Allow rules match the User-Agent as a case-insensitive **substring**, support `*`/`?` **wildcards** (`TiviMate*`, `*Kodi*`), or a regular expression when wrapped in delimiters (`/^VLC\/3/i`)
+- Each allow rule picks what the client receives: the server's own playlist, the **full** playlist, or the **clear** playlist
+- Rules can be enabled/disabled and reordered (first match wins); a tester shows which rule (if any) a given user agent matches
+- Enforcement can be toggled in the UI, or defaulted through `IPTV_UA_ENFORCE` (defaults to on); matched/denied requests set an `X-UA-Rule` header and are written to the live log even when debug mode is off
 
 **Browser preview**
 - Play button on every feed (and on each channel row, using its first enabled feed) opens an inline player dialog
@@ -113,6 +123,8 @@ Ports and bind address are read from a `.env` file in the project root (see `.en
 | `IPTV_PORT` | `8000` | Web UI port |
 | `IPTV_PLAYLIST_PORT` | `8001` | Playlist feed port |
 | `IPTV_CLEAR_PORT` | `8002` | Clear-only feed port |
+| `IPTV_DEBUG` | `0` | Default live-log debug mode (overridden by the UI toggle stored in the DB) |
+| `IPTV_UA_ENFORCE` | `1` | User-agent allow-list enforcement (overridden by the UI toggle stored in the DB) |
 | `PHP_BIN` | `php` | PHP binary used by the launcher |
 
 Example: expose to a trusted LAN on other ports — edit `.env`:
@@ -146,19 +158,21 @@ Everything lives in a single SQLite file at `data/iptv.sqlite`. On first run the
 - `data/` is git-ignored (database, cache, logs, PID files) — nothing local is committed
 - Existing single-stream channels are migrated automatically into one feed each; DRM feeds are initially assigned to the playlist server only, clear feeds to both, preserving the previous output
 - Query and playlist caches live in `data/cache/` and are rebuilt automatically
+- The live request log lives in `data/requests.log` (git-ignored) and auto-rotates
 - Channel and feed edits bump a cache version, so the playlist feed reflects changes immediately
 
 ### Security notes
 
 - Change the default `admin` password before exposing the service beyond localhost. The seeded account stores a password hash in SQLite; to reset it, delete the `admin` row from the `admins` table and reload the app.
 - The built-in PHP server and single-port-per-role routing are intended for local or trusted-network use, not as an internet-facing production deployment.
+- User-agent rules are a convenience control, not authentication — clients set the `User-Agent` header freely, so treat them as filtering, not access control.
 - Browser DRM playback requires a secure context (`https://` or `localhost`) and a license server that allows cross-origin requests from your origin.
 
 ## Project layout
 
 ```
 index.php        Web UI: routes, actions, views, preview player
-lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers, .env loader
+lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers, live log, UA security, .env loader
 playlist.php     Cached M3U endpoint (ETag / 304), reused for the full and clear feeds
 playlist-clear.php Clear-server M3U endpoint (feeds assigned to clear or both)
 router.php       Per-port routing and style.css cache headers
@@ -166,7 +180,7 @@ style.css        UI styling
 iptv-manager     start / stop / restart / status launcher
 .env.example     Configuration template (copy to .env)
 docs/screenshots README screenshots
-data/            SQLite DB, cache, logs (git-ignored)
+data/            SQLite DB, cache, request log, PID files (git-ignored)
 ```
 
 ## Notes

@@ -10,6 +10,14 @@ $clearPort = (int) (getenv('IPTV_CLEAR_PORT') ?: 8002);
 $webPort = (int) (getenv('IPTV_PORT') ?: 8000);
 $serverPort = (int) ($_SERVER['SERVER_PORT'] ?? 0);
 
+$service = match (true) {
+    $serverPort === $clearPort => 'clear',
+    $serverPort === $playlistPort => 'playlist',
+    $serverPort === $webPort => 'web',
+    default => 'other',
+};
+startRequestLogging($service);
+
 if (!is_string($requestPath) || str_starts_with($requestPath, '/data/') || preg_match('~(?:^|/)\.~', $requestPath)) {
     http_response_code(404);
     exit;

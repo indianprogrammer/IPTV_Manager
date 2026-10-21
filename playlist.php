@@ -8,6 +8,22 @@ initializeDatabase($db);
 
 $clearOnly = $GLOBALS['playlistClearOnly'] ?? false;
 
+$decision = evaluateUserAgent((string) ($_SERVER['HTTP_USER_AGENT'] ?? ''));
+if ($decision['rule'] !== null) {
+    $rulePattern = preg_replace('/[^\x20-\x7E]/', '.', (string) $decision['rule']['pattern']);
+    header('X-UA-Rule: ' . $decision['action'] . ' ' . $rulePattern);
+    requestNote('ua:' . $decision['action'] . ':' . $decision['rule']['pattern']);
+    $clearOnly = $decision['action'] === 'clear';
+} else {
+    requestNote('ua:deny');
+}
+
+if ($decision['action'] === 'block') {
+    header('Cache-Control: no-store');
+    http_response_code(404);
+    exit;
+}
+
 $playlist = cachedPlaylist($db, $clearOnly);
 $content = $playlist['content'];
 $generatedAt = (int) $playlist['generated_at'];

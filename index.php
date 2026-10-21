@@ -378,10 +378,85 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $result['updated'],
                 $result['skipped']
             ));
+        } elseif ($action === 'debug_toggle') {
+            $enabled = !requestDebugEnabled();
+            setRequestDebugMode($enabled);
+            flash($enabled
+                ? 'Debug mode on — every request to all three servers is now logged.'
+                : 'Debug mode off — only user-agent security events are logged.');
+        } elseif ($action === 'log_clear') {
+            clearRequestLog();
+            flash('Request log cleared.');
+        } elseif ($action === 'ua_settings') {
+            $enforced = (string) ($_POST['enforce'] ?? '0') === '1';
+            setUserAgentEnforced($enforced);
+            flash($enforced
+                ? 'User-agent enforcement enabled — rules are applied to both playlist servers.'
+                : 'User-agent enforcement disabled — all clients get the default playlist.');
+        } elseif ($action === 'ua_rule_save') {
+            $ruleId = trim((string) ($_POST['id'] ?? ''));
+            $pattern = trim((string) ($_POST['pattern'] ?? ''));
+            validateUserAgentPattern($pattern);
+            $ruleAction = (string) ($_POST['rule_action'] ?? '');
+            if (!array_key_exists($ruleAction, userAgentRuleActions())) {
+                throw new RuntimeException('Unknown rule action.');
+            }
+            $rule = [
+                'id' => $ruleId !== '' ? $ruleId : bin2hex(random_bytes(6)),
+                'pattern' => $pattern,
+                'action' => $ruleAction,
+                'note' => trim((string) ($_POST['note'] ?? '')),
+                'enabled' => isset($_POST['rule_enabled']),
+            ];
+            $rules = userAgentRules();
+            $replaced = false;
+            if ($ruleId !== '') {
+                foreach ($rules as $index => $existing) {
+                    if ((string) $existing['id'] === $ruleId) {
+                        $rules[$index] = $rule;
+                        $replaced = true;
+                        break;
+                    }
+                }
+                if (!$replaced) {
+                    throw new RuntimeException('Rule not found.');
+                }
+            } else {
+                $rules[] = $rule;
+            }
+            saveUserAgentRules($rules);
+            flash($replaced ? 'Rule updated.' : 'Rule added.');
+        } elseif ($action === 'ua_rule_delete') {
+            $ruleId = (string) ($_POST['id'] ?? '');
+            $rules = array_values(array_filter(
+                userAgentRules(),
+                static fn (array $rule): bool => (string) $rule['id'] !== $ruleId
+            ));
+            saveUserAgentRules($rules);
+            flash('Rule deleted.');
+        } elseif ($action === 'ua_rule_move') {
+            $ruleId = (string) ($_POST['id'] ?? '');
+            $direction = (string) ($_POST['dir'] ?? '') === 'up' ? -1 : 1;
+            $rules = userAgentRules();
+            foreach ($rules as $index => $rule) {
+                if ((string) $rule['id'] !== $ruleId) {
+                    continue;
+                }
+                $target = $index + $direction;
+                if ($target < 0 || $target >= count($rules)) {
+                    break;
+                }
+                [$rules[$index], $rules[$target]] = [$rules[$target], $rules[$index]];
+                flash('Rule order updated — the first matching rule wins.');
+                break;
+            }
+            saveUserAgentRules($rules);
         } else {
             throw new RuntimeException('Unknown action.');
         }
-        bumpCacheVersion($db);
+        if (!in_array($action, ['debug_toggle', 'log_clear', 'ua_settings', 'ua_rule_save', 'ua_rule_delete', 'ua_rule_move'], true)) {
+            bumpCacheVersion($db);
+        }
     } catch (Throwable $error) {
         flash($error->getMessage(), 'error');
     }
@@ -397,6 +472,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         'date' => $_GET['date'] ?? null,
         'guide_category' => $_GET['guide_category'] ?? null,
         'guide_page' => $_GET['guide_page'] ?? null,
+        'log' => isset($_GET['log']) ? '1' : null,
+        'security' => isset($_GET['security']) ? '1' : null,
+        'test' => trim((string) ($_GET['test'] ?? '')) ?: null,
+        'edit_rule' => trim((string) ($_GET['edit_rule'] ?? '')) ?: null,
         'edit' => isset($_GET['edit']) ? (string) max(0, (int) $_GET['edit']) : null,
     ], static fn ($value): bool => is_string($value) && $value !== ''));
     redirect('index.php' . ($query !== '' ? '?' . $query : ''));
@@ -404,8 +483,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $loggedIn = isset($_SESSION['admin']);
 $guideMode = $loggedIn && isset($_GET['guide']);
+$logMode = $loggedIn && isset($_GET['log']);
+$securityMode = $loggedIn && isset($_GET['security']);
 $flashMessage = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
+
+if (isset($_GET['tail'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!$loggedIn) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Sign-in required.']);
+        exit;
+    }
+    $logSize = is_file(requestLogPath()) ? (int) filesize(requestLogPath()) : 0;
+    echo (string) json_encode([
+        'debug' => requestDebugEnabled(),
+        'size' => $logSize,
+        'entries' => readRequestLog(200),
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
 
 function h(?string $value): string
 {
@@ -587,12 +685,55 @@ function feedDrmWarning(array $feed): string
     return '<p class="feed-warning">This feed has DRM settings but is visible on the clear server.</p>';
 }
 
+function logRowHtml(array $entry): string
+{
+    $status = (int) ($entry['status'] ?? 0);
+    $statusClass = $status >= 500 ? 'st-error' : ($status >= 400 ? 'st-block' : 'st-ok');
+    $timestamp = str_replace('T', ' ', substr((string) ($entry['t'] ?? ''), 0, 19));
+    $service = (string) ($entry['service'] ?? '');
+    $note = (string) ($entry['note'] ?? '');
+    $noteHtml = $note !== ''
+        ? '<span class="note-chip">' . h($note) . '</span>'
+        : '<span class="empty-value">—</span>';
+    $detail = h((string) json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+    return '<tr>'
+        . '<td class="mono">' . h($timestamp) . '</td>'
+        . '<td><span class="service-chip service-' . h($service) . '">' . h($service !== '' ? $service : '—') . '</span></td>'
+        . '<td class="mono ' . $statusClass . '">' . $status . '</td>'
+        . '<td class="mono">' . h((string) ($entry['method'] ?? '')) . '</td>'
+        . '<td class="mono uri-cell" title="' . h((string) ($entry['uri'] ?? '')) . '">' . h((string) ($entry['uri'] ?? '')) . '</td>'
+        . '<td class="mono">' . h((string) ($entry['ip'] ?? '')) . '</td>'
+        . '<td class="mono ua-cell" title="' . h((string) ($entry['ua'] ?? '')) . '">' . h((string) ($entry['ua'] ?? '')) . '</td>'
+        . '<td>' . $noteHtml . '</td>'
+        . '<td><button type="button" class="button secondary small-button log-detail-button" data-detail="' . $detail . '">Details</button></td>'
+        . '</tr>';
+}
+
+function logDetailFields(array $entry): array
+{
+    return [
+        'Time' => str_replace('T', ' ', substr((string) ($entry['t'] ?? ''), 0, 25)),
+        'Server' => (string) ($entry['service'] ?? ''),
+        'Method' => (string) ($entry['method'] ?? ''),
+        'Status' => (string) ($entry['status'] ?? ''),
+        'Duration' => isset($entry['ms']) ? $entry['ms'] . ' ms' : '',
+        'Client IP' => (string) ($entry['ip'] ?? ''),
+        'Protocol' => (string) ($entry['proto'] ?? ''),
+        'Host' => (string) ($entry['host'] ?? ''),
+        'Referer' => (string) ($entry['referer'] ?? ''),
+        'Path' => (string) ($entry['uri'] ?? ''),
+        'User agent' => (string) ($entry['ua'] ?? ''),
+        'Security decision' => (string) ($entry['note'] ?? ''),
+    ];
+}
+
 ?><!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title><?= $loggedIn ? ($guideMode ? 'TV Guide · IPTV Manager' : 'Channels · IPTV Manager') : 'Sign in · IPTV Manager' ?></title>
+    <title><?= $loggedIn ? h($logMode ? 'Live log · IPTV Manager' : ($securityMode ? 'Security · IPTV Manager' : ($guideMode ? 'TV Guide · IPTV Manager' : 'Channels · IPTV Manager'))) : 'Sign in · IPTV Manager' ?></title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -798,6 +939,33 @@ function feedDrmWarning(array $feed): string
         };
     }
     $manageCategories = isset($_GET['categories']);
+    if ($logMode) {
+        $debugMode = requestDebugEnabled();
+        $logEntries = readRequestLog(200);
+    }
+    if ($securityMode) {
+        $uaEnforced = userAgentEnforced();
+        $uaRules = userAgentRules();
+        $uaActions = userAgentRuleActions();
+        $uaActionLabels = [
+            'serve' => 'Allow · default playlist',
+            'playlist' => 'Allow · full playlist',
+            'clear' => 'Allow · clear playlist',
+            'block' => 'Deny (404)',
+        ];
+        $editRule = null;
+        $editRuleId = trim((string) ($_GET['edit_rule'] ?? ''));
+        if ($editRuleId !== '') {
+            foreach ($uaRules as $rule) {
+                if ((string) $rule['id'] === $editRuleId) {
+                    $editRule = $rule;
+                    break;
+                }
+            }
+        }
+        $uaTest = trim((string) ($_GET['test'] ?? ''));
+        $uaTestResult = $uaTest !== '' ? evaluateUserAgentRules($uaTest, $uaRules) : null;
+    }
     $editChannel = null;
     $editId = filter_input(INPUT_GET, 'edit', FILTER_VALIDATE_INT);
     if ($editId) {
@@ -864,6 +1032,8 @@ function feedDrmWarning(array $feed): string
         <div class="topbar-right">
             <span class="admin-label"><span class="online-dot"></span><?= h((string) $_SESSION['admin']) ?></span>
             <a class="button text-button" href="index.php?guide=1"<?= $guideMode ? ' aria-current="page"' : '' ?>>TV Guide</a>
+            <a class="button text-button" href="index.php?log=1"<?= $logMode ? ' aria-current="page"' : '' ?>>Live log</a>
+            <a class="button text-button" href="index.php?security=1"<?= $securityMode ? ' aria-current="page"' : '' ?>>Security</a>
             <a class="button text-button" href="index.php?add=1"<?= $addChannel ? ' aria-current="page"' : '' ?>>Add channel</a>
             <a class="button text-button" href="index.php?import=1"<?= $importPlaylist ? ' aria-current="page"' : '' ?>>Import playlist</a>
             <a class="button text-button categories-link" href="index.php?categories=1"<?= $manageCategories ? ' aria-current="page"' : '' ?>>Manage categories</a>
@@ -1206,6 +1376,516 @@ function feedDrmWarning(array $feed): string
                 </div>
                 <?php if ($uncategorizedCount > 0): ?>
                     <p class="category-note muted"><?= (int) $uncategorizedCount ?> uncategorized <?= $uncategorizedCount === 1 ? 'channel is' : 'channels are' ?> not listed here. Assign them a category from each channel's edit page.</p>
+                <?php endif; ?>
+            </section>
+        <?php elseif ($logMode): ?>
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow">LIVE LOG · DEBUG MODE</p>
+                        <h2>Request log</h2>
+                        <p class="muted">While debug mode is on, every request received by the web, playlist and clear servers is recorded here — client IP, user agent, path, status and timing. User-agent security decisions are recorded even when debug mode is off.</p>
+                    </div>
+                    <div class="log-controls">
+                        <form method="post" action="index.php?log=1" class="inline-form">
+                            <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                            <input type="hidden" name="action" value="debug_toggle">
+                            <button class="button <?= $debugMode ? 'danger-button' : 'primary' ?>" type="submit">Debug mode: <?= $debugMode ? 'ON' : 'OFF' ?></button>
+                        </form>
+                        <form method="post" action="index.php?log=1" class="inline-form" onsubmit="return confirm('Clear the request log?')">
+                            <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                            <input type="hidden" name="action" value="log_clear">
+                            <button class="button secondary" type="submit">Clear log</button>
+                        </form>
+                        <label class="log-live"><input type="checkbox" id="log-autorefresh" checked> Live</label>
+                    </div>
+                </div>
+                <div class="state-row">
+                    <span class="state-dot <?= $debugMode ? 'on' : 'off' ?>" id="log-indicator"></span>
+                    <span class="muted" id="log-state"><?= $debugMode
+                        ? 'Debug mode on — recording all requests from every server.'
+                        : 'Debug mode off — only user-agent security events are recorded.' ?></span>
+                </div>
+                <div class="log-filters">
+                    <div class="search-box log-search">
+                        <span>⌕</span>
+                        <input type="search" id="log-filter-text" placeholder="Filter by path, IP or user agent…" aria-label="Filter log entries">
+                    </div>
+                    <select id="log-filter-service" aria-label="Filter by server">
+                        <option value="">All servers</option>
+                        <option value="web">Web UI</option>
+                        <option value="playlist">Playlist</option>
+                        <option value="clear">Clear</option>
+                    </select>
+                    <select id="log-filter-status" aria-label="Filter by status">
+                        <option value="">All statuses</option>
+                        <option value="200">Success (2xx)</option>
+                        <option value="400">Client error (4xx)</option>
+                        <option value="500">Server error (5xx)</option>
+                    </select>
+                    <select id="log-filter-security" aria-label="Filter by security decision">
+                        <option value="">All decisions</option>
+                        <option value="allowed">Allowed (rule matched)</option>
+                        <option value="denied">Denied (no rule)</option>
+                    </select>
+                    <span class="log-filter-count muted" id="log-filter-count"></span>
+                    <button class="button secondary small-button" type="button" id="log-filter-clear" hidden>Clear filters</button>
+                </div>
+                <div class="table-wrap">
+                    <table class="log-table">
+                        <thead>
+                            <tr><th>Time</th><th>Server</th><th>Status</th><th>Method</th><th>Path</th><th>Client IP</th><th>User agent</th><th>Security decision</th><th class="log-detail-head">Detail</th></tr>
+                        </thead>
+                        <tbody id="log-rows">
+                            <?php foreach ($logEntries as $entry): ?>
+                                <?= logRowHtml($entry) ?>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="guide-empty" id="log-empty"<?= $logEntries !== [] ? ' hidden' : '' ?>>
+                    <strong>No requests recorded yet</strong>
+                    <span>Turn debug mode on, then load the playlist feed — new lines appear here within two seconds.</span>
+                </div>
+                <div class="guide-empty" id="log-no-match" hidden>
+                    <strong>No requests match the filters</strong>
+                    <span>Adjust or clear the filters to see more entries.</span>
+                </div>
+            </section>
+            <dialog class="detail-dialog" id="log-detail">
+                <div class="detail-shell">
+                    <header class="detail-head">
+                        <div>
+                            <p class="eyebrow">REQUEST DETAIL</p>
+                            <h2 id="log-detail-title">Request</h2>
+                        </div>
+                        <button class="button secondary small-button" type="button" id="log-detail-close">Close</button>
+                    </header>
+                    <dl class="detail-grid" id="log-detail-body"></dl>
+                    <div class="detail-section">
+                        <h3>Request headers</h3>
+                        <pre class="detail-pre" id="log-detail-headers">No headers recorded.</pre>
+                    </div>
+                </div>
+            </dialog>
+            <script>
+            (() => {
+                const dialog = document.getElementById('log-detail');
+                const title = document.getElementById('log-detail-title');
+                const body = document.getElementById('log-detail-body');
+                const headersPre = document.getElementById('log-detail-headers');
+                const closeButton = document.getElementById('log-detail-close');
+                window.showDetails = (entry) => {
+                    if (!dialog || !body) {
+                        return;
+                    }
+                    title.textContent = String(entry.method || '') + ' ' + String(entry.uri || '');
+                    body.textContent = '';
+                    const fields = [
+                        ['Time', String(entry.t || '').replace('T', ' ').slice(0, 25)],
+                        ['Server', entry.service || ''],
+                        ['Method', entry.method || ''],
+                        ['Status', String(entry.status ?? '')],
+                        ['Duration', (entry.ms ?? '') + ' ms'],
+                        ['Client IP', entry.ip || ''],
+                        ['Protocol', entry.proto || ''],
+                        ['Host', entry.host || ''],
+                        ['Referer', entry.referer || ''],
+                        ['Path', entry.uri || ''],
+                        ['User agent', entry.ua || ''],
+                        ['Security decision', entry.note || '—'],
+                    ];
+                    fields.forEach(([label, value]) => {
+                        const dt = document.createElement('dt');
+                        dt.textContent = label;
+                        const dd = document.createElement('dd');
+                        dd.textContent = value === '' ? '—' : String(value);
+                        body.appendChild(dt);
+                        body.appendChild(dd);
+                    });
+                    const headers = entry.headers && typeof entry.headers === 'object' ? entry.headers : null;
+                    if (headers && Object.keys(headers).length > 0) {
+                        headersPre.textContent = Object.entries(headers)
+                            .map(([name, value]) => name + ': ' + value)
+                            .join('\n');
+                    } else {
+                        headersPre.textContent = 'No headers recorded.';
+                    }
+                    if (!dialog.open) {
+                        dialog.showModal();
+                    }
+                };
+                if (closeButton) {
+                    closeButton.addEventListener('click', () => dialog.close());
+                }
+                if (dialog) {
+                    dialog.addEventListener('click', (event) => {
+                        if (event.target === dialog) {
+                            dialog.close();
+                        }
+                    });
+                }
+            })();
+            </script>
+            <script>
+            (() => {
+                const rows = document.getElementById('log-rows');
+                const empty = document.getElementById('log-empty');
+                const state = document.getElementById('log-state');
+                const indicator = document.getElementById('log-indicator');
+                const liveToggle = document.getElementById('log-autorefresh');
+                if (!rows || !liveToggle) {
+                    return;
+                }
+
+                const cell = (text, className) => {
+                    const td = document.createElement('td');
+                    td.textContent = text;
+                    if (className) {
+                        td.className = className;
+                    }
+                    return td;
+                };
+
+                const buildRow = (entry) => {
+                    const tr = document.createElement('tr');
+                    const time = String(entry.t || '').replace('T', ' ').slice(0, 19);
+                    const status = Number(entry.status || 0);
+                    const statusClass = status >= 500 ? 'st-error' : (status >= 400 ? 'st-block' : 'st-ok');
+                    const service = String(entry.service || '');
+                    const uri = String(entry.uri || '');
+                    const ua = String(entry.ua || '');
+                    const note = String(entry.note || '');
+
+                    tr.appendChild(cell(time, 'mono'));
+
+                    const serviceCell = document.createElement('td');
+                    const chip = document.createElement('span');
+                    chip.className = 'service-chip service-' + service;
+                    chip.textContent = service || '—';
+                    serviceCell.appendChild(chip);
+                    tr.appendChild(serviceCell);
+
+                    tr.appendChild(cell(String(status), 'mono ' + statusClass));
+                    tr.appendChild(cell(String(entry.method || ''), 'mono'));
+
+                    const uriCell = cell(uri, 'mono uri-cell');
+                    uriCell.title = uri;
+                    tr.appendChild(uriCell);
+
+                    tr.appendChild(cell(String(entry.ip || ''), 'mono'));
+
+                    const uaCell = cell(ua, 'mono ua-cell');
+                    uaCell.title = ua;
+                    tr.appendChild(uaCell);
+
+                    if (note !== '') {
+                        const noteCell = document.createElement('td');
+                        const chipNote = document.createElement('span');
+                        chipNote.className = 'note-chip';
+                        chipNote.textContent = note;
+                        noteCell.appendChild(chipNote);
+                        tr.appendChild(noteCell);
+                    } else {
+                        tr.appendChild(cell('—', 'empty-value'));
+                    }
+
+                    const detailCell = document.createElement('td');
+                    const detailButton = document.createElement('button');
+                    detailButton.type = 'button';
+                    detailButton.className = 'button secondary small-button log-detail-button';
+                    detailButton.textContent = 'Details';
+                    detailButton.addEventListener('click', () => showDetails(entry));
+                    detailCell.appendChild(detailButton);
+                    tr.appendChild(detailCell);
+                    return tr;
+                };
+
+                const render = (entries) => {
+                    rows.textContent = '';
+                    entries.forEach((entry) => rows.appendChild(buildRow(entry)));
+                    if (empty) {
+                        empty.hidden = entries.length > 0;
+                    }
+                };
+
+                const filterText = document.getElementById('log-filter-text');
+                const filterService = document.getElementById('log-filter-service');
+                const filterStatus = document.getElementById('log-filter-status');
+                const filterSecurity = document.getElementById('log-filter-security');
+                const filterCount = document.getElementById('log-filter-count');
+                const filterClear = document.getElementById('log-filter-clear');
+                const noMatch = document.getElementById('log-no-match');
+                let allEntries = [];
+
+                const filtersActive = () => {
+                    return (filterText && filterText.value.trim() !== '')
+                        || (filterService && filterService.value !== '')
+                        || (filterStatus && filterStatus.value !== '')
+                        || (filterSecurity && filterSecurity.value !== '');
+                };
+
+                const matchesFilters = (entry) => {
+                    if (filterText) {
+                        const needle = filterText.value.trim().toLowerCase();
+                        if (needle !== '') {
+                            const haystack = [entry.uri, entry.ip, entry.ua, entry.method, entry.note, entry.host]
+                                .map((value) => String(value || '').toLowerCase())
+                                .join(' ');
+                            if (!haystack.includes(needle)) {
+                                return false;
+                            }
+                        }
+                    }
+                    if (filterService && filterService.value !== '' && String(entry.service || '') !== filterService.value) {
+                        return false;
+                    }
+                    if (filterStatus && filterStatus.value !== '') {
+                        const bucket = Math.floor(Number(entry.status || 0) / 100);
+                        if (String(bucket * 100) !== filterStatus.value) {
+                            return false;
+                        }
+                    }
+                    if (filterSecurity && filterSecurity.value !== '') {
+                        const note = String(entry.note || '');
+                        if (filterSecurity.value === 'allowed' && !(note.startsWith('ua:') && !note.startsWith('ua:deny'))) {
+                            return false;
+                        }
+                        if (filterSecurity.value === 'denied' && note !== 'ua:deny') {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
+                const applyFilters = () => {
+                    const filtered = allEntries.filter(matchesFilters);
+                    render(filtered);
+                    const active = filtersActive();
+                    if (filterClear) {
+                        filterClear.hidden = !active;
+                    }
+                    if (filterCount) {
+                        filterCount.textContent = active
+                            ? filtered.length + ' of ' + allEntries.length + ' shown'
+                            : '';
+                    }
+                    if (noMatch) {
+                        noMatch.hidden = !(active && filtered.length === 0 && allEntries.length > 0);
+                    }
+                    if (empty && active) {
+                        empty.hidden = true;
+                    }
+                };
+
+                const poll = async () => {
+                    try {
+                        const response = await fetch('index.php?log=1&tail=1', {
+                            headers: { Accept: 'application/json' },
+                            credentials: 'same-origin',
+                            cache: 'no-store',
+                        });
+                        if (!response.ok) {
+                            throw new Error('HTTP ' + response.status);
+                        }
+                        const data = await response.json();
+                        const entries = Array.isArray(data.entries) ? data.entries : [];
+                        allEntries = entries;
+                        applyFilters();
+                        if (state) {
+                            state.textContent = data.debug
+                                ? 'Debug mode on — ' + entries.length + ' recent ' + (entries.length === 1 ? 'entry' : 'entries') + ' loaded.'
+                                : 'Debug mode off — only user-agent security events are recorded.';
+                        }
+                        if (indicator) {
+                            indicator.className = 'state-dot ' + (data.debug ? 'on' : 'off');
+                        }
+                    } catch (error) {
+                        if (state) {
+                            state.textContent = 'Live updates failed: ' + error.message;
+                        }
+                    }
+                };
+
+                [filterText, filterService, filterStatus, filterSecurity].forEach((control) => {
+                    if (control) {
+                        control.addEventListener('input', applyFilters);
+                        control.addEventListener('change', applyFilters);
+                    }
+                });
+                if (filterClear) {
+                    filterClear.addEventListener('click', () => {
+                        if (filterText) filterText.value = '';
+                        if (filterService) filterService.value = '';
+                        if (filterStatus) filterStatus.value = '';
+                        if (filterSecurity) filterSecurity.value = '';
+                        applyFilters();
+                    });
+                }
+
+                let timer = null;
+                const sync = () => {
+                    if (timer !== null) {
+                        clearInterval(timer);
+                        timer = null;
+                    }
+                    if (liveToggle.checked) {
+                        timer = setInterval(poll, 2000);
+                    }
+                };
+                liveToggle.addEventListener('change', sync);
+                sync();
+                poll();
+
+                rows.addEventListener('click', (event) => {
+                    const button = event.target.closest('.log-detail-button');
+                    if (!button || !button.dataset.detail) {
+                        return;
+                    }
+                    try {
+                        window.showDetails(JSON.parse(button.dataset.detail));
+                    } catch (error) {
+                        // Ignore malformed rows.
+                    }
+                });
+            })();
+            </script>
+        <?php elseif ($securityMode): ?>
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow">USER-AGENT SECURITY</p>
+                        <h2>Playlist access rules</h2>
+                        <p class="muted">Access is <strong>denied by default</strong> — every client receives <strong>404 Not Found</strong> unless its User-Agent matches an allow rule below. Add one rule per client (player) you want to let in; the first matching rule decides what that client receives: the server's default playlist, the full playlist, or the clear playlist.</p>
+                    </div>
+                    <form method="post" action="index.php?security=1" class="enforce-form">
+                        <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                        <input type="hidden" name="action" value="ua_settings">
+                        <label class="enforce-label">Enforcement
+                            <select name="enforce">
+                                <option value="1" <?= $uaEnforced ? 'selected' : '' ?>>Enabled</option>
+                                <option value="0" <?= $uaEnforced ? '' : 'selected' ?>>Disabled (allow all)</option>
+                            </select>
+                        </label>
+                        <button class="button primary" type="submit">Save</button>
+                    </form>
+                </div>
+                <div class="state-row">
+                    <span class="state-dot <?= $uaEnforced ? 'on' : 'off' ?>"></span>
+                    <span class="muted"><?= $uaEnforced
+                        ? 'Enforcement is on — unmatched clients are denied with 404; only the allow rules below let a client through.'
+                        : 'Enforcement is OFF — every client is allowed and receives the default playlist. Turn this on to lock the feeds down.' ?></span>
+                </div>
+                <div class="ua-test">
+                    <form method="get" action="index.php" class="ua-test-form">
+                        <input type="hidden" name="security" value="1">
+                        <input name="test" value="<?= h($uaTest) ?>" placeholder="User-Agent to test, e.g. VLC/3.0.20 libVLC/3.0.20" spellcheck="false">
+                        <button class="button secondary" type="submit">Test user agent</button>
+                    </form>
+                    <?php if ($uaTestResult !== null): ?>
+                        <?php $matchedRule = $uaTestResult['rule']; ?>
+                        <div class="test-result action-<?= h((string) $uaTestResult['action']) ?>">
+                            <strong><?= h($uaActionLabels[$uaTestResult['action']] ?? (string) $uaTestResult['action']) ?></strong>
+                            <?php if ($matchedRule !== null): ?>
+                                <span>matched rule <code><?= h((string) $matchedRule['pattern']) ?></code><?= $matchedRule['note'] !== '' ? ' · ' . h((string) $matchedRule['note']) : '' ?></span>
+                            <?php else: ?>
+                                <span>no rule matched — the client is <strong>denied</strong> with 404 Not Found</span>
+                            <?php endif; ?>
+                            <?php if (!$uaEnforced): ?>
+                                <span class="muted">Enforcement is off, so this outcome is not applied yet.</span>
+                            <?php endif; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </section>
+
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow"><?= $editRule !== null ? 'EDIT RULE' : 'NEW RULE' ?></p>
+                        <h2><?= $editRule !== null ? 'Edit rule' : 'Add a rule' ?></h2>
+                        <p class="muted">A pattern matches when it is <strong>contained in</strong> the User-Agent (case-insensitive). Use <code>*</code> as a wildcard for "any text", e.g. <code>VLC</code>, <code>*Kodi*</code>, <code>TiviMate*</code>. A pattern wrapped in delimiters (<code>/</code>, <code>#</code>, <code>~</code> or <code>!</code>) is treated as a regular expression instead, e.g. <code>/^VLC\/3/i</code>. Disabled rules are skipped.</p>
+                    </div>
+                    <?php if ($editRule !== null): ?><a class="button secondary" href="index.php?security=1">Cancel edit</a><?php endif; ?>
+                </div>
+                <form method="post" action="index.php?security=1" class="channel-edit-form">
+                    <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                    <input type="hidden" name="action" value="ua_rule_save">
+                    <?php if ($editRule !== null): ?><input type="hidden" name="id" value="<?= h((string) $editRule['id']) ?>"><?php endif; ?>
+                    <div class="form-grid">
+                        <label class="span-2">Allowed user-agent<input name="pattern" value="<?= h((string) ($editRule['pattern'] ?? '')) ?>" placeholder="VLC or *Kodi* or TiviMate*" required autofocus spellcheck="false"><small>Any UA containing this text is allowed. Use <code>*</code> as a wildcard; wrap in <code>/.../</code> for a regular expression.</small></label>
+                        <label>Action
+                            <select name="rule_action">
+                                <?php foreach ($uaActions as $value => $label): ?>
+                                    <option value="<?= h($value) ?>" <?= (string) ($editRule['action'] ?? 'serve') === $value ? 'selected' : '' ?>><?= h($label) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <small>What an allowed client receives.</small>
+                        </label>
+                        <label>Note<input name="note" value="<?= h((string) ($editRule['note'] ?? '')) ?>" placeholder="Optional — shown in the live log"></label>
+                        <label class="checkbox-label"><input type="checkbox" name="rule_enabled" value="1"<?= ($editRule['enabled'] ?? true) ? ' checked' : '' ?>> Rule enabled</label>
+                    </div>
+                    <div class="form-actions">
+                        <button class="button primary" type="submit"><?= $editRule !== null ? 'Save rule' : 'Allow this user agent' ?></button>
+                        <?php if ($editRule !== null): ?><a class="button secondary" href="index.php?security=1">Cancel</a><?php endif; ?>
+                    </div>
+                </form>
+            </section>
+
+            <section class="table-card">
+                <div class="table-toolbar">
+                    <div>
+                        <h2>Allow rules</h2>
+                        <p class="muted"><?= count($uaRules) ?> <?= count($uaRules) === 1 ? 'rule' : 'rules' ?> · evaluated top to bottom, first match wins · anything not listed is denied</p>
+                    </div>
+                </div>
+                <?php if ($uaRules === []): ?>
+                    <div class="guide-empty">
+                        <strong>No allow rules yet</strong>
+                        <span>Add a rule above to let a specific user agent in. Everything else is denied with 404.</span>
+                    </div>
+                <?php else: ?>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr><th>#</th><th>Pattern</th><th>Action</th><th>Note</th><th>Status</th><th class="rule-actions-head">Manage</th></tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($uaRules as $index => $rule): ?>
+                                    <tr<?= $rule['enabled'] ? '' : ' class="rule-disabled"' ?>>
+                                        <td><?= $index + 1 ?></td>
+                                        <td><code class="rule-pattern"><?= h((string) $rule['pattern']) ?></code></td>
+                                        <td><span class="rule-badge action-<?= h((string) $rule['action']) ?>"><?= h($uaActionLabels[$rule['action']] ?? (string) $rule['action']) ?></span></td>
+                                        <td><?= $rule['note'] !== '' ? h((string) $rule['note']) : '<span class="empty-value">—</span>' ?></td>
+                                        <td><?= $rule['enabled'] ? 'Enabled' : 'Disabled' ?></td>
+                                        <td class="rule-actions">
+                                            <form method="post" action="index.php?security=1" class="inline-form">
+                                                <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                                                <input type="hidden" name="action" value="ua_rule_move">
+                                                <input type="hidden" name="id" value="<?= h((string) $rule['id']) ?>">
+                                                <input type="hidden" name="dir" value="up">
+                                                <button class="button secondary small-button" type="submit"<?= $index === 0 ? ' disabled' : '' ?> title="Move rule up" aria-label="Move rule up">↑</button>
+                                            </form>
+                                            <form method="post" action="index.php?security=1" class="inline-form">
+                                                <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                                                <input type="hidden" name="action" value="ua_rule_move">
+                                                <input type="hidden" name="id" value="<?= h((string) $rule['id']) ?>">
+                                                <input type="hidden" name="dir" value="down">
+                                                <button class="button secondary small-button" type="submit"<?= $index === count($uaRules) - 1 ? ' disabled' : '' ?> title="Move rule down" aria-label="Move rule down">↓</button>
+                                            </form>
+                                            <a class="button secondary small-button" href="index.php?security=1&amp;edit_rule=<?= h((string) $rule['id']) ?>">Edit</a>
+                                            <form method="post" action="index.php?security=1" class="inline-form" onsubmit="return confirm('Delete this rule?')">
+                                                <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                                                <input type="hidden" name="action" value="ua_rule_delete">
+                                                <input type="hidden" name="id" value="<?= h((string) $rule['id']) ?>">
+                                                <button class="button small-button danger-button" type="submit">Delete</button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
                 <?php endif; ?>
             </section>
         <?php else: ?>
