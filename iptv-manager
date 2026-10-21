@@ -6,9 +6,11 @@ DATA_DIR="$PROJECT_DIR/data"
 WEB_PID_FILE="$DATA_DIR/web-server.pid"
 PLAYLIST_PID_FILE="$DATA_DIR/playlist-server.pid"
 CLEAR_PID_FILE="$DATA_DIR/clear-server.pid"
+AUTO_PID_FILE="$DATA_DIR/auto-server.pid"
 WEB_LOG_FILE="$DATA_DIR/web-server.log"
 PLAYLIST_LOG_FILE="$DATA_DIR/playlist-server.log"
 CLEAR_LOG_FILE="$DATA_DIR/clear-server.log"
+AUTO_LOG_FILE="$DATA_DIR/auto-server.log"
 
 load_dotenv() {
     local file=$1 line name value
@@ -44,11 +46,13 @@ HOST=${IPTV_HOST:-127.0.0.1}
 WEB_PORT=${IPTV_PORT:-8000}
 PLAYLIST_PORT=${IPTV_PLAYLIST_PORT:-8001}
 CLEAR_PORT=${IPTV_CLEAR_PORT:-8002}
+AUTO_PORT=${IPTV_AUTO_PORT:-8003}
 PHP_BIN=${PHP_BIN:-$(command -v php || true)}
 
 usage() {
-    echo "Usage: $0 {start|stop|restart|status}" >&2
-    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT clear=$CLEAR_PORT (set them in .env, or override with IPTV_PORT, IPTV_PLAYLIST_PORT and IPTV_CLEAR_PORT)" >&2
+    echo "Usage: $0 {start|stop|restart|status|run}" >&2
+    echo "Ports: web=$WEB_PORT playlist=$PLAYLIST_PORT clear=$CLEAR_PORT auto=$AUTO_PORT (set them in .env, or override with IPTV_PORT, IPTV_PLAYLIST_PORT, IPTV_CLEAR_PORT and IPTV_AUTO_PORT)" >&2
+    echo "  run   start every server in the foreground and supervise them (used by the system service)" >&2
 }
 
 read_pid() {
@@ -196,6 +200,59 @@ status_server() {
     return 3
 }
 
+stop_all() {
+    stop_server "Auto" "$AUTO_PORT" "$AUTO_PID_FILE"
+    stop_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE"
+    stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
+    stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
+}
+
+handle_shutdown() {
+    trap - TERM INT
+    echo "Shutting down servers..."
+    stop_all
+    exit 0
+}
+
+run_foreground() {
+    local -a child_pids=()
+    local pid_file pid
+
+    stop_all >/dev/null 2>&1 || true
+
+    if ! start_all; then
+        return 1
+    fi
+
+    for pid_file in "$WEB_PID_FILE" "$PLAYLIST_PID_FILE" "$CLEAR_PID_FILE" "$AUTO_PID_FILE"; do
+        read_pid "$pid_file"
+        if [ -n "$SERVER_PID" ]; then
+            child_pids+=("$SERVER_PID")
+        fi
+    done
+
+    if [ "${#child_pids[@]}" -eq 0 ]; then
+        echo "Error: no server processes are running." >&2
+        return 1
+    fi
+
+    trap handle_shutdown TERM INT
+
+    echo "Running in the foreground. Send SIGTERM or press Ctrl+C to stop."
+
+    while true; do
+        sleep 1 &
+        wait $! 2>/dev/null
+        for pid in "${child_pids[@]}"; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "Error: server process $pid exited unexpectedly." >&2
+                stop_all >/dev/null 2>&1 || true
+                return 1
+            fi
+        done
+    done
+}
+
 start_all() {
     if [ -z "$PHP_BIN" ]; then
         echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
@@ -205,8 +262,9 @@ start_all() {
         echo "Error: PHP must have the PDO SQLite extension enabled." >&2
         return 1
     fi
-    if [ "$WEB_PORT" = "$PLAYLIST_PORT" ] || [ "$WEB_PORT" = "$CLEAR_PORT" ] || [ "$PLAYLIST_PORT" = "$CLEAR_PORT" ]; then
-        echo "Error: web, playlist and clear ports must be different." >&2
+    if [ "$WEB_PORT" = "$PLAYLIST_PORT" ] || [ "$WEB_PORT" = "$CLEAR_PORT" ] || [ "$WEB_PORT" = "$AUTO_PORT" ] \
+        || [ "$PLAYLIST_PORT" = "$CLEAR_PORT" ] || [ "$PLAYLIST_PORT" = "$AUTO_PORT" ] || [ "$CLEAR_PORT" = "$AUTO_PORT" ]; then
+        echo "Error: web, playlist, clear and auto ports must be different." >&2
         return 1
     fi
     mkdir -p "$DATA_DIR" || {
@@ -224,20 +282,29 @@ start_all() {
         stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
         return 1
     fi
+    if ! start_server "Auto" "$AUTO_PORT" "$AUTO_PID_FILE" "$AUTO_LOG_FILE"; then
+        stop_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE"
+        stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
+        stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
+        return 1
+    fi
 }
 
 case ${1:-} in
     start) start_all ;;
     stop)
+        stop_server "Auto" "$AUTO_PORT" "$AUTO_PID_FILE"
+        auto_status=$?
         stop_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE"
         clear_status=$?
         stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE"
         playlist_status=$?
         stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE"
         web_status=$?
-        [ "$clear_status" -eq 0 ] && [ "$playlist_status" -eq 0 ] && [ "$web_status" -eq 0 ]
+        [ "$auto_status" -eq 0 ] && [ "$clear_status" -eq 0 ] && [ "$playlist_status" -eq 0 ] && [ "$web_status" -eq 0 ]
         ;;
     restart)
+        stop_server "Auto" "$AUTO_PORT" "$AUTO_PID_FILE" || exit $?
         stop_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE" || exit $?
         stop_server "Playlist" "$PLAYLIST_PORT" "$PLAYLIST_PID_FILE" || exit $?
         stop_server "Web UI" "$WEB_PORT" "$WEB_PID_FILE" || exit $?
@@ -250,13 +317,16 @@ case ${1:-} in
         playlist_status=$?
         status_server "Clear" "$CLEAR_PORT" "$CLEAR_PID_FILE"
         clear_status=$?
-        if [ "$web_status" -eq 0 ] && [ "$playlist_status" -eq 0 ] && [ "$clear_status" -eq 0 ]; then
+        status_server "Auto" "$AUTO_PORT" "$AUTO_PID_FILE"
+        auto_status=$?
+        if [ "$web_status" -eq 0 ] && [ "$playlist_status" -eq 0 ] && [ "$clear_status" -eq 0 ] && [ "$auto_status" -eq 0 ]; then
             exit 0
-        elif [ "$web_status" -eq 3 ] && [ "$playlist_status" -eq 3 ] && [ "$clear_status" -eq 3 ]; then
+        elif [ "$web_status" -eq 3 ] && [ "$playlist_status" -eq 3 ] && [ "$clear_status" -eq 3 ] && [ "$auto_status" -eq 3 ]; then
             exit 3
         else
             exit 1
         fi
         ;;
+    run) run_foreground ;;
     *) usage; exit 2 ;;
 esac

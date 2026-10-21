@@ -467,8 +467,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $enforced = (string) ($_POST['enforce'] ?? '0') === '1';
             setUserAgentEnforced($enforced);
             flash($enforced
-                ? 'User-agent enforcement enabled — rules are applied to both playlist servers.'
+                ? 'User-agent enforcement enabled — rules are applied to every playlist server.'
                 : 'User-agent enforcement disabled — all clients get the default playlist.');
+        } elseif ($action === 'ua_auto_default') {
+            setUserAgentAutoDefault((string) ($_POST['variant'] ?? ''));
+            flash('Auto port default updated.');
         } elseif ($action === 'ua_rule_save') {
             $ruleId = trim((string) ($_POST['id'] ?? ''));
             $pattern = trim((string) ($_POST['pattern'] ?? ''));
@@ -530,7 +533,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             throw new RuntimeException('Unknown action.');
         }
-        if (!in_array($action, ['debug_toggle', 'log_clear', 'ua_settings', 'ua_rule_save', 'ua_rule_delete', 'ua_rule_move'], true)) {
+        if (!in_array($action, ['debug_toggle', 'log_clear', 'ua_settings', 'ua_auto_default', 'ua_rule_save', 'ua_rule_delete', 'ua_rule_move'], true)) {
             bumpCacheVersion($db);
         }
     } catch (Throwable $error) {
@@ -1029,6 +1032,8 @@ function logDetailFields(array $entry): array
             'clear' => 'Allow · clear playlist',
             'block' => 'Deny (404)',
         ];
+        $uaVariants = userAgentPlaylistVariants();
+        $uaAutoDefault = userAgentAutoDefault();
         $editRule = null;
         $editRuleId = trim((string) ($_GET['edit_rule'] ?? ''));
         if ($editRuleId !== '') {
@@ -1041,6 +1046,7 @@ function logDetailFields(array $entry): array
         }
         $uaTest = trim((string) ($_GET['test'] ?? ''));
         $uaTestResult = $uaTest !== '' ? evaluateUserAgentRules($uaTest, $uaRules) : null;
+        $uaTestAuto = $uaTest !== '' ? autoPlaylistVariant($uaTest) : null;
     }
     $editChannel = null;
     $editId = filter_input(INPUT_GET, 'edit', FILTER_VALIDATE_INT);
@@ -1092,6 +1098,8 @@ function logDetailFields(array $entry): array
     $playlistUrl = 'http://' . $playlistHost . ':' . $playlistPort . '/';
     $clearPort = (int) (getenv('IPTV_CLEAR_PORT') ?: 8002);
     $clearUrl = 'http://' . $playlistHost . ':' . $clearPort . '/';
+    $autoPort = (int) (getenv('IPTV_AUTO_PORT') ?: 8003);
+    $autoUrl = 'http://' . $playlistHost . ':' . $autoPort . '/';
     $baseQuery = array_filter(['q' => $search, 'category' => $category], static fn ($value): bool => $value !== '');
     $listParams = $baseQuery;
     if ($page > 1) {
@@ -1113,8 +1121,9 @@ function logDetailFields(array $entry): array
             <a class="button text-button" href="index.php?add=1"<?= $addChannel ? ' aria-current="page"' : '' ?>>Add channel</a>
             <a class="button text-button" href="index.php?import=1"<?= $importPlaylist ? ' aria-current="page"' : '' ?>>Import playlist</a>
             <a class="button text-button categories-link" href="index.php?categories=1"<?= $manageCategories ? ' aria-current="page"' : '' ?>>Manage categories</a>
-            <a class="button text-button" href="<?= h($playlistUrl) ?>" download="iptv-manager.m3u">Download M3U</a>
-            <a class="button text-button" href="<?= h($clearUrl) ?>" download="iptv-manager-clear.m3u">Clear M3U</a>
+                <a class="button text-button" href="<?= h($playlistUrl) ?>" download="iptv-manager.m3u">Download M3U</a>
+                <a class="button text-button" href="<?= h($clearUrl) ?>" download="iptv-manager-clear.m3u">Clear M3U</a>
+                <a class="button text-button" href="<?= h($autoUrl) ?>" download="iptv-manager-auto.m3u">Auto M3U</a>
             <form method="post" class="purge-cache-form">
                 <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
                 <input type="hidden" name="action" value="purge_cache">
@@ -1191,7 +1200,8 @@ function logDetailFields(array $entry): array
             <section class="table-card guide-card">
                 <div class="table-toolbar guide-toolbar">
                     <div>
-                        <h2>TV guide</h2>
+                        <p class="eyebrow">TV GUIDE</p>
+                        <h2>Schedule</h2>
                         <p class="muted"><?= h($guideDate->format('l, F j, Y')) ?> · <?= number_format($guideTotal) ?> <?= $guideTotal === 1 ? 'channel' : 'channels' ?> · times in <?= h(date('T')) ?></p>
                     </div>
                     <form method="get" class="filters guide-filters">
@@ -1515,6 +1525,7 @@ function logDetailFields(array $entry): array
                         <option value="web">Web UI</option>
                         <option value="playlist">Playlist</option>
                         <option value="clear">Clear</option>
+                        <option value="auto">Auto</option>
                     </select>
                     <select id="log-filter-status" aria-label="Filter by status">
                         <option value="">All statuses</option>
@@ -1853,6 +1864,32 @@ function logDetailFields(array $entry): array
             <section class="form-card">
                 <div class="form-card-head">
                     <div>
+                        <p class="eyebrow">AUTO PLAYLIST</p>
+                        <h2>One address for every player</h2>
+                        <p class="muted">The auto port looks at the rule the client matches and serves the matching playlist: <strong>clear playlist</strong> for players without DRM support (VLC, MPV), <strong>full playlist</strong> for players that handle DRM (Kodi, TiviMate, Perfect Player), and a rule that only allows the client falls back to the default below. Clients that match no rule are denied with <strong>404 Not Found</strong>.</p>
+                    </div>
+                    <form method="post" action="index.php?security=1" class="enforce-form">
+                        <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                        <input type="hidden" name="action" value="ua_auto_default">
+                        <label class="enforce-label">Default playlist
+                            <select name="variant">
+                                <?php foreach ($uaVariants as $value => $label): ?>
+                                    <option value="<?= h($value) ?>" <?= $uaAutoDefault === $value ? 'selected' : '' ?>><?= h($label) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </label>
+                        <button class="button primary" type="submit">Save</button>
+                    </form>
+                </div>
+                <div class="state-row">
+                    <span class="state-dot on"></span>
+                    <span class="muted">Auto endpoint <code><?= h($autoUrl) ?></code> — point every player at this address and let the rules decide what it receives.</span>
+                </div>
+            </section>
+
+            <section class="form-card">
+                <div class="form-card-head">
+                    <div>
                         <p class="eyebrow">USER-AGENT SECURITY</p>
                         <h2>Playlist access rules</h2>
                         <p class="muted">Access is <strong>denied by default</strong> — every client receives <strong>404 Not Found</strong> unless its User-Agent matches an allow rule below. Add one rule per client (player) you want to let in; the first matching rule decides what that client receives: the server's default playlist, the full playlist, or the clear playlist.</p>
@@ -1890,6 +1927,11 @@ function logDetailFields(array $entry): array
                             <?php else: ?>
                                 <span>no rule matched — the client is <strong>denied</strong> with 404 Not Found</span>
                             <?php endif; ?>
+                            <?php if ($uaTestAuto !== null): ?>
+                                <span>auto port sends: <strong><?= $uaTestAuto['variant'] === 'deny'
+                                    ? '404 Not Found'
+                                    : ($uaTestAuto['variant'] === 'clear' ? 'the clear playlist' : 'the full playlist') ?></strong></span>
+                            <?php endif; ?>
                             <?php if (!$uaEnforced): ?>
                                 <span class="muted">Enforcement is off, so this outcome is not applied yet.</span>
                             <?php endif; ?>
@@ -1919,7 +1961,7 @@ function logDetailFields(array $entry): array
                                     <option value="<?= h($value) ?>" <?= (string) ($editRule['action'] ?? 'serve') === $value ? 'selected' : '' ?>><?= h($label) ?></option>
                                 <?php endforeach; ?>
                             </select>
-                            <small>What an allowed client receives.</small>
+                            <small>What an allowed client receives. <strong>Default playlist</strong> means the playlist of the port the client uses — on the auto port it is the default set above.</small>
                         </label>
                         <label>Note<input name="note" value="<?= h((string) ($editRule['note'] ?? '')) ?>" placeholder="Optional — shown in the live log"></label>
                         <label class="checkbox-label"><input type="checkbox" name="rule_enabled" value="1"<?= ($editRule['enabled'] ?? true) ? ' checked' : '' ?>> Rule enabled</label>
@@ -1934,6 +1976,7 @@ function logDetailFields(array $entry): array
             <section class="table-card">
                 <div class="table-toolbar">
                     <div>
+                        <p class="eyebrow">ACCESS CONTROL</p>
                         <h2>Allow rules</h2>
                         <p class="muted"><?= count($uaRules) ?> <?= count($uaRules) === 1 ? 'rule' : 'rules' ?> · evaluated top to bottom, first match wins · anything not listed is denied</p>
                     </div>
@@ -1996,23 +2039,29 @@ function logDetailFields(array $entry): array
 
         <section class="table-card">
             <div class="table-toolbar">
-                <div><h2>Channel library</h2><p class="muted"><?= number_format($totalFiltered) ?> matching channels</p></div>
-                <form method="get" class="filters">
-                    <label class="search-box"><span aria-hidden="true">⌕</span><input type="search" name="q" value="<?= h($search) ?>" placeholder="Search channels, IDs, URLs"></label>
-                    <select name="category" aria-label="Filter by category">
-                        <option value="">All categories</option>
-                        <?php foreach ($categories as $item): ?>
-                            <option value="<?= h((string) $item) ?>" <?= $category === $item ? 'selected' : '' ?>><?= h((string) $item) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                    <button class="button secondary" type="submit">Filter</button>
-                    <?php if ($search !== '' || $category !== ''): ?><a class="clear-link" href="index.php">Clear</a><?php endif; ?>
-                </form>
-                <form method="post" id="bulk-delete-form" class="bulk-delete-form" onsubmit="return confirm('Delete ' + document.querySelectorAll('.bulk-checkbox:checked').length + ' selected channels?')">
-                    <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
-                    <input type="hidden" name="action" value="delete_selected">
-                    <button class="button danger-button" type="submit">Delete selected</button>
-                </form>
+                <div>
+                    <p class="eyebrow">CHANNEL LIBRARY</p>
+                    <h2>Channels</h2>
+                    <p class="muted"><?= number_format($totalFiltered) ?> matching channels</p>
+                </div>
+                <div class="table-toolbar-actions">
+                    <form method="get" class="filters">
+                        <label class="search-box"><span aria-hidden="true">⌕</span><input type="search" name="q" value="<?= h($search) ?>" placeholder="Search channels, IDs, URLs"></label>
+                        <select name="category" aria-label="Filter by category">
+                            <option value="">All categories</option>
+                            <?php foreach ($categories as $item): ?>
+                                <option value="<?= h((string) $item) ?>" <?= $category === $item ? 'selected' : '' ?>><?= h((string) $item) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <button class="button secondary" type="submit">Filter</button>
+                        <?php if ($search !== '' || $category !== ''): ?><a class="clear-link" href="index.php">Clear</a><?php endif; ?>
+                    </form>
+                    <form method="post" id="bulk-delete-form" class="bulk-delete-form" onsubmit="return confirm('Delete ' + document.querySelectorAll('.bulk-checkbox:checked').length + ' selected channels?')">
+                        <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                        <input type="hidden" name="action" value="delete_selected">
+                        <button class="button danger-button" type="submit">Delete selected</button>
+                    </form>
+                </div>
             </div>
             <div class="table-wrap">
                 <table>

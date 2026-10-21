@@ -7,10 +7,12 @@ $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $requestQuery = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_QUERY);
 $playlistPort = (int) (getenv('IPTV_PLAYLIST_PORT') ?: 8001);
 $clearPort = (int) (getenv('IPTV_CLEAR_PORT') ?: 8002);
+$autoPort = (int) (getenv('IPTV_AUTO_PORT') ?: 8003);
 $webPort = (int) (getenv('IPTV_PORT') ?: 8000);
 $serverPort = (int) ($_SERVER['SERVER_PORT'] ?? 0);
 
 $service = match (true) {
+    $serverPort === $autoPort => 'auto',
     $serverPort === $clearPort => 'clear',
     $serverPort === $playlistPort => 'playlist',
     $serverPort === $webPort => 'web',
@@ -20,6 +22,16 @@ startRequestLogging($service);
 
 if (!is_string($requestPath) || str_starts_with($requestPath, '/data/') || preg_match('~(?:^|/)\.~', $requestPath)) {
     http_response_code(404);
+    exit;
+}
+
+if ($serverPort === $autoPort) {
+    if ($requestPath !== '/' || $requestQuery !== null) {
+        header('Location: /', true, 302);
+        exit;
+    }
+
+    require __DIR__ . '/playlist-auto.php';
     exit;
 }
 

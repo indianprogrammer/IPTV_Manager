@@ -1748,6 +1748,34 @@ function setUserAgentEnforced(bool $enabled): void
     setMetaValue(database(), 'ua_enforce', $enabled ? '1' : '0');
 }
 
+function userAgentPlaylistVariants(): array
+{
+    return [
+        'playlist' => 'Full playlist — every feed assigned to the playlist server',
+        'clear' => 'Clear playlist — every feed assigned to the clear server',
+    ];
+}
+
+function userAgentAutoDefault(): string
+{
+    $default = 'playlist';
+    try {
+        $value = strtolower(trim((string) metaValue(database(), 'ua_auto_default', $default)));
+    } catch (Throwable) {
+        $value = $default;
+    }
+    return array_key_exists($value, userAgentPlaylistVariants()) ? $value : $default;
+}
+
+function setUserAgentAutoDefault(string $value): void
+{
+    $value = strtolower(trim($value));
+    if (!array_key_exists($value, userAgentPlaylistVariants())) {
+        throw new RuntimeException('Unknown playlist variant.');
+    }
+    setMetaValue(database(), 'ua_auto_default', $value);
+}
+
 function userAgentPatternRegex(string $pattern): ?string
 {
     $first = $pattern === '' ? '' : $pattern[0];
@@ -1832,4 +1860,27 @@ function evaluateUserAgent(string $userAgent): array
     } catch (Throwable) {
         return ['action' => 'block', 'rule' => null];
     }
+}
+
+/**
+ * Resolve what the auto playlist port serves for a user agent.
+ *
+ * Returns 'playlist' for the full playlist, 'clear' for the clear playlist
+ * and 'deny' when the client gets a 404. A rule that only allows the client
+ * falls back to the default playlist of the auto port.
+ */
+function autoPlaylistVariant(string $userAgent): array
+{
+    $decision = evaluateUserAgent($userAgent);
+    $action = (string) $decision['action'];
+    $rule = $decision['rule'];
+
+    $variant = match ($action) {
+        'block' => 'deny',
+        'clear' => 'clear',
+        'playlist' => 'playlist',
+        default => userAgentAutoDefault(),
+    };
+
+    return ['variant' => $variant, 'action' => $action, 'rule' => $rule];
 }

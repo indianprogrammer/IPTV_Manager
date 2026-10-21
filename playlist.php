@@ -6,14 +6,21 @@ require_once __DIR__ . '/lib.php';
 $db = database();
 initializeDatabase($db);
 
-$clearOnly = $GLOBALS['playlistClearOnly'] ?? false;
+$serverPlaylist = $GLOBALS['playlistClearOnly'] ?? false;
+$clearOnly = $serverPlaylist;
 
 $decision = evaluateUserAgent((string) ($_SERVER['HTTP_USER_AGENT'] ?? ''));
 if ($decision['rule'] !== null) {
     $rulePattern = preg_replace('/[^\x20-\x7E]/', '.', (string) $decision['rule']['pattern']);
     header('X-UA-Rule: ' . $decision['action'] . ' ' . $rulePattern);
     requestNote('ua:' . $decision['action'] . ':' . $decision['rule']['pattern']);
-    $clearOnly = $decision['action'] === 'clear';
+    $clearOnly = match ($decision['action']) {
+        'clear' => true,
+        'playlist' => false,
+        default => $serverPlaylist,
+    };
+} elseif ($decision['action'] === 'serve') {
+    requestNote('ua:allow-all');
 } else {
     requestNote('ua:deny');
 }
@@ -32,9 +39,11 @@ $etag = '"' . sha1($content) . '"';
 header('Content-Type: audio/x-mpegurl; charset=utf-8');
 header('Content-Disposition: inline; filename="' . ($clearOnly ? 'iptv-manager-clear.m3u' : 'iptv-manager.m3u') . '"');
 header('Cache-Control: public, max-age=60, must-revalidate');
+header('Vary: User-Agent');
 header('ETag: ' . $etag);
 header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $generatedAt) . ' GMT');
 header('X-Playlist-Cache: ' . ($playlist['cached'] ? 'HIT' : 'MISS'));
+header('X-Playlist-Variant: ' . ($clearOnly ? 'clear' : 'full'));
 
 $ifNoneMatch = trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''));
 if ($ifNoneMatch !== '') {

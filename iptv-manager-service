@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+#
+# iptv-manager-service — install the IPTV Manager as a system service so the
+# web UI and the playlist feeds start automatically on boot.
+#
+# The script writes a unit file for systemd (or an init script for SysV
+# systems), enables it at boot and starts it right away.
+#
+set -u
+
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+LAUNCHER="$PROJECT_DIR/iptv-manager"
+DATA_DIR="$PROJECT_DIR/data"
+ENV_FILE="$PROJECT_DIR/.env"
+SERVICE_NAME="iptv-manager"
+SYSTEMD_UNIT="/etc/systemd/system/$SERVICE_NAME.service"
+SYSV_INIT="/etc/init.d/$SERVICE_NAME"
+SERVICE_USER=${IPTV_SERVICE_USER:-}
+SYSTEMD_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+usage() {
+    cat >&2 <<EOF
+Usage: sudo $0 {install|uninstall|enable|disable|start|stop|restart|status|logs|print-unit}
+
+  install     Install the system service, enable it on boot and start it
+  uninstall   Stop the service and remove the system service files
+  enable      Enable the service on boot
+  disable     Disable the service on boot
+  start       Start the service
+  stop        Stop the service
+  restart     Restart the service
+  status      Show the service and server status
+  logs        Follow the service log (journalctl -u $SERVICE_NAME)
+  print-unit  Print the generated unit file without installing anything
+
+Environment:
+  IPTV_SERVICE_USER   User the service runs as (default: the invoking user)
+EOF
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Error: this action must run as root. Try: sudo $0 $1" >&2
+        exit 1
+    fi
+}
+
+have_systemd() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+read_env_value() {
+    local key=$1 default=$2 value= name line
+    if [ -r "$ENV_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%$'\r'}
+            case $line in
+                ''|\#*) continue ;;
+                *=*) ;;
+                *) continue ;;
+            esac
+            name=${line%%=*}
+            value=${line#*=}
+            name=${name//[[:space:]]/}
+            [ "$name" = "$key" ] || continue
+            if [ "${#value}" -ge 2 ]; then
+                case $value in
+                    \"*\") value=${value#\"}; value=${value%\"} ;;
+                    \'*\") value=${value#\'}; value=${value%\'} ;;
+                esac
+            fi
+            break
+        done < "$ENV_FILE"
+    fi
+    [ -n "$value" ] || value=$default
+    printf '%s\n' "$value"
+}
+
+config_value() {
+    local key=$1 default=$2
+    if [ -n "${!key:-}" ]; then
+        printf '%s\n' "${!key}"
+        return 0
+    fi
+    read_env_value "$key" "$default"
+}
+
+resolve_service_user() {
+    local owner
+    if [ -n "$SERVICE_USER" ]; then
+        printf '%s\n' "$SERVICE_USER"
+        return 0
+    fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        printf '%s\n' "$SUDO_USER"
+        return 0
+    fi
+    owner=$(stat -c %U "$PROJECT_DIR" 2>/dev/null || true)
+    if [ -n "$owner" ] && [ "$owner" != root ]; then
+        printf '%s\n' "$owner"
+        return 0
+    fi
+    printf 'root\n'
+}
+
+resolve_php_bin() {
+    local configured
+    configured=$(config_value PHP_BIN "")
+    if [ -n "$configured" ]; then
+        if [ -x "$configured" ]; then
+            printf '%s\n' "$configured"
+            return 0
+        fi
+        if command -v "$configured" >/dev/null 2>&1; then
+            command -v "$configured"
+            return 0
+        fi
+    fi
+    command -v php 2>/dev/null || true
+}
+
+run_as_service_user() {
+    if [ "$(id -u)" -eq 0 ] && [ "$(id -un)" != "$SERVICE_USER" ]; then
+        if command -v runuser >/dev/null 2>&1; then
+            runuser -u "$SERVICE_USER" -- "$@"
+        else
+            su -s /bin/sh -c 'exec "$@"' "$SERVICE_USER" "$@"
+        fi
+    else
+        "$@"
+    fi
+}
+
+instance_running() {
+    local pid_file pid=
+    for pid_file in "$DATA_DIR/web-server.pid" "$DATA_DIR/playlist-server.pid" "$DATA_DIR/clear-server.pid"; do
+        [ -f "$pid_file" ] || continue
+        pid=
+        IFS= read -r pid < "$pid_file" 2>/dev/null || true
+        case $pid in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+prepare_data_dir() {
+    mkdir -p "$DATA_DIR" || {
+        echo "Error: could not create $DATA_DIR" >&2
+        exit 1
+    }
+    if [ "$(id -u)" -eq 0 ]; then
+        chown "$SERVICE_USER":"$(id -gn "$SERVICE_USER")" "$DATA_DIR" 2>/dev/null || true
+    fi
+    chmod 700 "$DATA_DIR" 2>/dev/null || true
+}
+
+unit_content() {
+    cat <<EOF
+[Unit]
+Description=IPTV Manager (channel library, M3U playlist feeds and TV guide)
+Documentation=file://$PROJECT_DIR/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
+WorkingDirectory=$PROJECT_DIR
+Environment=PATH=$SYSTEMD_PATH
+Environment=PHP_BIN=$PHP_BIN
+ExecStart=$LAUNCHER run
+ExecStop=$LAUNCHER stop
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=$SERVICE_NAME
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=$DATA_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+init_script_content() {
+    cat <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          $SERVICE_NAME
+# Required-Start:    \$remote_fs \$network
+# Required-Stop:     \$remote_fs \$network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: IPTV Manager servers
+# Description:       Starts the IPTV Manager web UI and playlist feeds.
+### END INIT INFO
+
+LAUNCHER="$LAUNCHER"
+SERVICE_USER="$SERVICE_USER"
+
+run_as_service_user() {
+    if [ "\$(id -u)" -eq 0 ] && [ "\$(id -un)" != "\$SERVICE_USER" ]; then
+        runuser -u "\$SERVICE_USER" -- "\$@"
+    else
+        "\$@"
+    fi
+}
+
+case "\$1" in
+    start)
+        run_as_service_user "\$LAUNCHER" start
+        ;;
+    stop)
+        run_as_service_user "\$LAUNCHER" stop
+        ;;
+    restart|force-reload)
+        run_as_service_user "\$LAUNCHER" restart
+        ;;
+    status)
+        run_as_service_user "\$LAUNCHER" status
+        ;;
+    *)
+        echo "Usage: \$0 {start|stop|restart|status}" >&2
+        exit 2
+        ;;
+esac
+EOF
+}
+
+wait_for_active() {
+    local tries=0
+    while [ "$tries" -lt 25 ]; do
+        if systemctl is-active --quiet "$SERVICE_NAME.service"; then
+            return 0
+        fi
+        tries=$((tries + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
+install_systemd() {
+    require_root install
+    prepare_data_dir
+    stop_manual_instance
+
+    unit_content > "$SYSTEMD_UNIT"
+    chmod 644 "$SYSTEMD_UNIT"
+
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME.service"
+    systemctl restart "$SERVICE_NAME.service"
+
+    if ! wait_for_active; then
+        echo "Error: the service did not become active. Recent log entries:" >&2
+        journalctl -u "$SERVICE_NAME.service" --no-pager --lines=20 >&2 || true
+        exit 1
+    fi
+
+    echo "Installed $SYSTEMD_UNIT"
+    systemctl --no-pager --lines=0 status "$SERVICE_NAME.service" || true
+    print_urls
+}
+
+uninstall_systemd() {
+    require_root uninstall
+    systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_UNIT"
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    stop_manual_instance
+    echo "Removed $SYSTEMD_UNIT"
+}
+
+install_sysv() {
+    require_root install
+    prepare_data_dir
+    stop_manual_instance
+
+    init_script_content > "$SYSV_INIT"
+    chmod 755 "$SYSV_INIT"
+
+    if command -v update-rc.d >/dev/null 2>&1; then
+        update-rc.d "$SERVICE_NAME" defaults >/dev/null 2>&1 || true
+    elif command -v chkconfig >/dev/null 2>&1; then
+        chkconfig --add "$SERVICE_NAME" >/dev/null 2>&1 || true
+        chkconfig "$SERVICE_NAME" on >/dev/null 2>&1 || true
+    fi
+
+    "$SYSV_INIT" start || true
+    echo "Installed $SYSV_INIT"
+    "$SYSV_INIT" status || true
+    print_urls
+}
+
+uninstall_sysv() {
+    require_root uninstall
+    if [ -x "$SYSV_INIT" ]; then
+        "$SYSV_INIT" stop >/dev/null 2>&1 || true
+    fi
+    if command -v update-rc.d >/dev/null 2>&1; then
+        update-rc.d -f "$SERVICE_NAME" remove >/dev/null 2>&1 || true
+    elif command -v chkconfig >/dev/null 2>&1; then
+        chkconfig --del "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    rm -f "$SYSV_INIT"
+    stop_manual_instance
+    echo "Removed $SYSV_INIT"
+}
+
+stop_manual_instance() {
+    if ! instance_running; then
+        return 0
+    fi
+    echo "Stopping the instance that is currently running outside the service..."
+    run_as_service_user "$LAUNCHER" stop >/dev/null 2>&1 || true
+    sleep 1
+}
+
+print_urls() {
+    local host port playlist_port clear_port auto_port
+    host=$(config_value IPTV_HOST 127.0.0.1)
+    port=$(config_value IPTV_PORT 8000)
+    playlist_port=$(config_value IPTV_PLAYLIST_PORT 8001)
+    clear_port=$(config_value IPTV_CLEAR_PORT 8002)
+    auto_port=$(config_value IPTV_AUTO_PORT 8003)
+    cat <<EOF
+
+URLs:
+  Web UI     http://$host:$port
+  Playlist   http://$host:$playlist_port
+  Clear feed http://$host:$clear_port
+  Auto feed  http://$host:$auto_port
+EOF
+}
+
+print_status() {
+    if have_systemd; then
+        systemctl --no-pager --lines=0 status "$SERVICE_NAME.service" || true
+    elif [ -x "$SYSV_INIT" ]; then
+        "$SYSV_INIT" status || true
+    else
+        echo "No system service is installed."
+    fi
+    echo
+    run_as_service_user "$LAUNCHER" status || true
+}
+
+systemctl_action() {
+    local action=$1
+    if ! have_systemd; then
+        echo "Error: systemd is not available on this system." >&2
+        exit 1
+    fi
+    if [ ! -f "$SYSTEMD_UNIT" ] && [ "$action" != "disable" ]; then
+        echo "Error: the system service is not installed. Run: sudo $0 install" >&2
+        exit 1
+    fi
+    systemctl "$action" "$SERVICE_NAME.service"
+}
+
+main() {
+    local action=${1:-}
+
+    if [ -z "$action" ]; then
+        usage
+        exit 2
+    fi
+
+    case $action in
+        print-unit)
+            SERVICE_USER=$(resolve_service_user)
+            if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+                echo "Error: the service user '$SERVICE_USER' does not exist. Set IPTV_SERVICE_USER." >&2
+                exit 1
+            fi
+            SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+            PHP_BIN=$(resolve_php_bin)
+            if [ -z "$PHP_BIN" ]; then
+                echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
+                exit 1
+            fi
+            unit_content
+            ;;
+        install|uninstall)
+            if [ ! -x "$LAUNCHER" ]; then
+                echo "Error: $LAUNCHER is missing or not executable." >&2
+                exit 1
+            fi
+            if [ ! -f "$PROJECT_DIR/router.php" ]; then
+                echo "Error: $PROJECT_DIR does not look like an IPTV Manager installation." >&2
+                exit 1
+            fi
+            SERVICE_USER=$(resolve_service_user)
+            if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+                echo "Error: the service user '$SERVICE_USER' does not exist. Set IPTV_SERVICE_USER." >&2
+                exit 1
+            fi
+            SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+            PHP_BIN=$(resolve_php_bin)
+            if [ -z "$PHP_BIN" ]; then
+                echo "Error: PHP was not found. Install PHP or set PHP_BIN." >&2
+                exit 1
+            fi
+            if have_systemd; then
+                if [ "$action" = install ]; then
+                    install_systemd
+                else
+                    uninstall_systemd
+                fi
+            else
+                if [ "$action" = install ]; then
+                    install_sysv
+                else
+                    uninstall_sysv
+                fi
+            fi
+            ;;
+        enable|disable|start|stop|restart)
+            if have_systemd; then
+                systemctl_action "$action"
+            elif [ -x "$SYSV_INIT" ]; then
+                case $action in
+                    enable)
+                        if command -v update-rc.d >/dev/null 2>&1; then
+                            update-rc.d "$SERVICE_NAME" enable >/dev/null 2>&1 || true
+                        fi
+                        echo "Enabled $SERVICE_NAME on boot."
+                        ;;
+                    disable)
+                        if command -v update-rc.d >/dev/null 2>&1; then
+                            update-rc.d "$SERVICE_NAME" disable >/dev/null 2>&1 || true
+                        fi
+                        echo "Disabled $SERVICE_NAME on boot."
+                        ;;
+                    start|stop|restart)
+                        "$SYSV_INIT" "$action"
+                        ;;
+                esac
+            else
+                echo "Error: no system service is installed. Run: sudo $0 install" >&2
+                exit 1
+            fi
+            ;;
+        status)
+            print_status
+            ;;
+        logs)
+            if have_systemd; then
+                journalctl -u "$SERVICE_NAME.service" -f -n 50
+            else
+                tail -f "$DATA_DIR/web-server.log" "$DATA_DIR/playlist-server.log" "$DATA_DIR/clear-server.log"
+            fi
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            echo "Error: unknown action '$action'" >&2
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
