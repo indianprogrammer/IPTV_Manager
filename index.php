@@ -1031,6 +1031,7 @@ function logDetailFields(array $entry): array
         <a class="brand" href="index.php"><span class="brand-mark small">▶</span><span>IPTV <b>Manager</b></span></a>
         <div class="topbar-right">
             <span class="admin-label"><span class="online-dot"></span><?= h((string) $_SESSION['admin']) ?></span>
+            <a class="button text-button" href="index.php"<?= (!$guideMode && !$logMode && !$securityMode && !$addChannel && !$importPlaylist && !$manageCategories && !$editChannel) ? ' aria-current="page"' : '' ?>>Dashboard</a>
             <a class="button text-button" href="index.php?guide=1"<?= $guideMode ? ' aria-current="page"' : '' ?>>TV Guide</a>
             <a class="button text-button" href="index.php?log=1"<?= $logMode ? ' aria-current="page"' : '' ?>>Live log</a>
             <a class="button text-button" href="index.php?security=1"<?= $securityMode ? ' aria-current="page"' : '' ?>>Security</a>
