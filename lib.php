@@ -118,7 +118,25 @@ function initializeDatabase(PDO $db): void
         );
         CREATE INDEX IF NOT EXISTS epg_programs_channel_idx ON epg_programs(channel_id, start_ts);
         CREATE INDEX IF NOT EXISTS epg_programs_epg_channel_idx ON epg_programs(epg_channel_id);
-        CREATE INDEX IF NOT EXISTS epg_programs_stop_idx ON epg_programs(stop_ts);'
+        CREATE INDEX IF NOT EXISTS epg_programs_stop_idx ON epg_programs(stop_ts);
+        CREATE TABLE IF NOT EXISTS feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            label TEXT NOT NULL DEFAULT \'\',
+            stream_url TEXT NOT NULL DEFAULT \'\',
+            license_key_url TEXT NOT NULL DEFAULT \'\',
+            drm_type TEXT NOT NULL DEFAULT \'\',
+            drm_key_id TEXT NOT NULL DEFAULT \'\',
+            drm_key TEXT NOT NULL DEFAULT \'\',
+            drm_headers TEXT NOT NULL DEFAULT \'\',
+            properties_json TEXT NOT NULL DEFAULT \'{}\',
+            visibility TEXT NOT NULL DEFAULT \'both\',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT \'\'
+        );
+        CREATE INDEX IF NOT EXISTS feeds_channel_idx ON feeds(channel_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS feeds_channel_stream_idx ON feeds(channel_id, stream_url);'
     );
 
     $statement = $db->prepare('INSERT OR IGNORE INTO admins (username, password_hash) VALUES (?, ?)');
@@ -128,6 +146,56 @@ function initializeDatabase(PDO $db): void
     ensureChannelColumn($db, 'drm_key_id', "TEXT NOT NULL DEFAULT ''");
     ensureChannelColumn($db, 'drm_key', "TEXT NOT NULL DEFAULT ''");
     ensureChannelColumn($db, 'drm_headers', "TEXT NOT NULL DEFAULT ''");
+
+    migrateChannelFeeds($db);
+}
+
+function migrateChannelFeeds(PDO $db): void
+{
+    if (metaValue($db, 'feeds_migrated') === '1') {
+        return;
+    }
+
+    $existingFeeds = (int) $db->query('SELECT COUNT(*) FROM feeds')->fetchColumn();
+    if ($existingFeeds === 0) {
+        $now = gmdate('Y-m-d H:i:s');
+        $insert = $db->prepare(
+            'INSERT INTO feeds (channel_id, label, stream_url, license_key_url, drm_type, drm_key_id, drm_key, '
+            . 'drm_headers, properties_json, visibility, enabled, sort_order, updated_at) '
+            . "VALUES (:channel_id, '', :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, "
+            . ':drm_headers, :properties, :visibility, :enabled, 0, :updated_at)'
+        );
+        $db->beginTransaction();
+        try {
+            $channels = $db->query(
+                "SELECT id, stream_url, license_key_url, drm_type, drm_key_id, drm_key, drm_headers, "
+                . "properties_json, enabled FROM channels WHERE stream_url != ''"
+            )->fetchAll();
+            foreach ($channels as $channel) {
+                $insert->execute([
+                    'channel_id' => (int) $channel['id'],
+                    'stream_url' => (string) $channel['stream_url'],
+                    'license_key_url' => (string) $channel['license_key_url'],
+                    'drm_type' => (string) $channel['drm_type'],
+                    'drm_key_id' => (string) $channel['drm_key_id'],
+                    'drm_key' => (string) $channel['drm_key'],
+                    'drm_headers' => (string) $channel['drm_headers'],
+                    'properties' => (string) $channel['properties_json'],
+                    'visibility' => channelHasDrm($channel) ? 'playlist' : 'both',
+                    'enabled' => (int) $channel['enabled'],
+                    'updated_at' => $now,
+                ]);
+            }
+            $db->commit();
+        } catch (Throwable $error) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+            throw $error;
+        }
+    }
+
+    setMetaValue($db, 'feeds_migrated', '1');
 }
 
 function ensureChannelColumn(PDO $db, string $column, string $definition): void
@@ -348,6 +416,76 @@ function channelHasDrm(array $channel): bool
         || $settings['key'] !== '';
 }
 
+function feedVisibilityOptions(): array
+{
+    return ['playlist', 'clear', 'both'];
+}
+
+function normalizeFeedVisibility(?string $value): string
+{
+    $visibility = strtolower(trim((string) $value));
+    if (!in_array($visibility, feedVisibilityOptions(), true)) {
+        throw new RuntimeException('Unknown feed visibility. Choose playlist, clear, or both.');
+    }
+    return $visibility;
+}
+
+function feedsForChannel(PDO $db, int $channelId): array
+{
+    $statement = $db->prepare('SELECT * FROM feeds WHERE channel_id = :channel_id ORDER BY sort_order, id');
+    $statement->execute(['channel_id' => $channelId]);
+    return $statement->fetchAll();
+}
+
+function insertFeed(PDO $db, int $channelId, array $feed): int
+{
+    $statement = $db->prepare(
+        'INSERT INTO feeds (channel_id, label, stream_url, license_key_url, drm_type, drm_key_id, drm_key, '
+        . 'drm_headers, properties_json, visibility, enabled, sort_order, updated_at) '
+        . 'VALUES (:channel_id, :label, :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, '
+        . ':drm_headers, :properties, :visibility, :enabled, :sort_order, :updated_at)'
+    );
+    $statement->execute([
+        'channel_id' => $channelId,
+        'label' => (string) ($feed['label'] ?? ''),
+        'stream_url' => (string) ($feed['stream_url'] ?? ''),
+        'license_key_url' => (string) ($feed['license'] ?? ''),
+        'drm_type' => (string) ($feed['drm']['type'] ?? ''),
+        'drm_key_id' => (string) ($feed['drm']['key_id'] ?? ''),
+        'drm_key' => (string) ($feed['drm']['key'] ?? ''),
+        'drm_headers' => (string) ($feed['drm']['headers'] ?? ''),
+        'properties' => (string) (json_encode((object) ($feed['properties'] ?? []), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
+        'visibility' => normalizeFeedVisibility((string) ($feed['visibility'] ?? 'both')),
+        'enabled' => (int) ($feed['enabled'] ?? 1),
+        'sort_order' => (int) ($feed['sort_order'] ?? 0),
+        'updated_at' => gmdate('Y-m-d H:i:s'),
+    ]);
+    return (int) $db->lastInsertId();
+}
+
+function updateFeed(PDO $db, int $feedId, array $feed): void
+{
+    $statement = $db->prepare(
+        'UPDATE feeds SET label = :label, stream_url = :stream_url, license_key_url = :license_key_url, '
+        . 'drm_type = :drm_type, drm_key_id = :drm_key_id, drm_key = :drm_key, drm_headers = :drm_headers, '
+        . 'properties_json = :properties, visibility = :visibility, updated_at = :updated_at '
+        . 'WHERE id = :id'
+    );
+    $statement->execute([
+        'label' => (string) ($feed['label'] ?? ''),
+        'stream_url' => (string) ($feed['stream_url'] ?? ''),
+        'license_key_url' => (string) ($feed['license'] ?? ''),
+        'drm_type' => (string) ($feed['drm']['type'] ?? ''),
+        'drm_key_id' => (string) ($feed['drm']['key_id'] ?? ''),
+        'drm_key' => (string) ($feed['drm']['key'] ?? ''),
+        'drm_headers' => (string) ($feed['drm']['headers'] ?? ''),
+        'properties' => (string) (json_encode((object) ($feed['properties'] ?? []), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
+        'visibility' => normalizeFeedVisibility((string) ($feed['visibility'] ?? 'both')),
+        'updated_at' => gmdate('Y-m-d H:i:s'),
+        'id' => $feedId,
+    ]);
+}
+
 function drmPlaylistProperties(array $channel): array
 {
     $type = strtolower(trim((string) ($channel['drm_type'] ?? '')));
@@ -386,14 +524,22 @@ function drmPlaylistProperties(array $channel): array
 function buildPlaylist(PDO $db, bool $clearOnly = false): string
 {
     $epgUrl = $db->query("SELECT value FROM app_meta WHERE name = 'epg_url'")->fetchColumn();
-    $channels = $db->query(
-        'SELECT name, tvg_id, tvg_name, tvg_language, tvg_type, group_title, logo_url, stream_url, properties_json, '
-        . 'license_key_url, drm_type, drm_key_id, drm_key, drm_headers '
-        . 'FROM channels WHERE enabled = 1 ORDER BY group_title COLLATE NOCASE, name COLLATE NOCASE'
-    )->fetchAll();
+    $visibility = $clearOnly ? 'clear' : 'playlist';
+    $statement = $db->prepare(
+        'SELECT c.id AS channel_id, c.name AS channel_name, c.tvg_id, c.tvg_name, c.tvg_language, c.tvg_type, '
+        . 'c.group_title, c.logo_url, f.label AS feed_label, f.stream_url, f.properties_json, '
+        . 'f.license_key_url, f.drm_type, f.drm_key_id, f.drm_key, f.drm_headers '
+        . 'FROM feeds f JOIN channels c ON c.id = f.channel_id '
+        . 'WHERE c.enabled = 1 AND f.enabled = 1 AND (f.visibility = \'both\' OR f.visibility = :visibility) '
+        . 'ORDER BY c.group_title COLLATE NOCASE, c.name COLLATE NOCASE, f.sort_order, f.id'
+    );
+    $statement->execute(['visibility' => $visibility]);
+    $feeds = $statement->fetchAll();
 
-    if ($clearOnly) {
-        $channels = array_values(array_filter($channels, static fn (array $channel): bool => !channelHasDrm($channel)));
+    $feedCounts = [];
+    foreach ($feeds as $feed) {
+        $channelId = (int) $feed['channel_id'];
+        $feedCounts[$channelId] = ($feedCounts[$channelId] ?? 0) + 1;
     }
 
     $headerAttributes = [];
@@ -402,34 +548,45 @@ function buildPlaylist(PDO $db, bool $clearOnly = false): string
     }
     $output = '#EXTM3U' . ($headerAttributes ? ' ' . implode(' ', $headerAttributes) : '') . "\n";
 
-    foreach ($channels as $channel) {
+    $emittedCounts = [];
+    foreach ($feeds as $feed) {
+        $channelId = (int) $feed['channel_id'];
+        $position = ($emittedCounts[$channelId] ?? 0) + 1;
+        $emittedCounts[$channelId] = $position;
+
+        $name = (string) $feed['channel_name'];
+        if ($feedCounts[$channelId] > 1) {
+            $label = trim((string) $feed['feed_label']);
+            $name .= ' (' . ($label !== '' ? $label : 'Feed ' . $position) . ')';
+        }
+
         $attributes = [
-            'tvg-id' => $channel['tvg_id'],
-            'tvg-name' => $channel['tvg_name'],
-            'tvg-logo' => $channel['logo_url'],
-            'tvg-language' => $channel['tvg_language'],
-            'tvg-type' => $channel['tvg_type'],
-            'group-title' => $channel['group_title'],
+            'tvg-id' => $feed['tvg_id'],
+            'tvg-name' => $feed['tvg_name'],
+            'tvg-logo' => $feed['logo_url'],
+            'tvg-language' => $feed['tvg_language'],
+            'tvg-type' => $feed['tvg_type'],
+            'group-title' => $feed['group_title'],
         ];
         $formattedAttributes = [];
-        foreach ($attributes as $name => $value) {
+        foreach ($attributes as $attrName => $value) {
             if ($value !== '') {
-                $formattedAttributes[] = $name . '="' . m3uEscape($value) . '"';
+                $formattedAttributes[] = $attrName . '="' . m3uEscape($value) . '"';
             }
         }
-        $output .= '#EXTINF:-1 ' . implode(' ', $formattedAttributes) . ',' . $channel['name'] . "\n";
+        $output .= '#EXTINF:-1 ' . implode(' ', $formattedAttributes) . ',' . $name . "\n";
 
-        $properties = json_decode($channel['properties_json'], true);
+        $properties = json_decode($feed['properties_json'], true);
         if (!is_array($properties)) {
             $properties = [];
         }
-        $properties = array_merge($properties, drmPlaylistProperties($channel));
-        foreach ($properties as $name => $value) {
-            if (is_string($name) && is_string($value) && !str_contains($name, "\n") && !str_contains($value, "\n")) {
-                $output .= '#KODIPROP:' . $name . '=' . $value . "\n";
+        $properties = array_merge($properties, drmPlaylistProperties($feed));
+        foreach ($properties as $propertyName => $value) {
+            if (is_string($propertyName) && is_string($value) && !str_contains($propertyName, "\n") && !str_contains($value, "\n")) {
+                $output .= '#KODIPROP:' . $propertyName . '=' . $value . "\n";
             }
         }
-        $output .= $channel['stream_url'] . "\n";
+        $output .= $feed['stream_url'] . "\n";
     }
 
     return $output;
@@ -437,7 +594,7 @@ function buildPlaylist(PDO $db, bool $clearOnly = false): string
 
 function cachedPlaylist(PDO $db, bool $clearOnly = false): array
 {
-    $signature = databaseSignature() . ':' . cacheVersion($db) . ($clearOnly ? ':clear' : ':all');
+    $signature = databaseSignature() . ':' . cacheVersion($db) . ($clearOnly ? ':clear-v2' : ':all-v2');
     $contentFile = null;
     $metaFile = null;
 
@@ -722,72 +879,138 @@ function importPlaylist(PDO $db, string $content): array
         throw new RuntimeException('No channels found in the playlist. Expected an M3U playlist with #EXTINF entries.');
     }
 
-    $insert = $db->prepare(
+    $findChannelBySourceId = $db->prepare('SELECT id FROM channels WHERE source_id = :source_id');
+    $findChannelsByName = $db->prepare('SELECT id FROM channels WHERE name = :name');
+    $insertChannel = $db->prepare(
         'INSERT INTO channels (source_id, name, tvg_id, tvg_name, group_title, tvg_language, tvg_type, '
-        . 'logo_url, stream_url, license_key_url, drm_type, drm_key_id, drm_key, drm_headers, '
-        . 'attributes_json, properties_json, url_fields_json, enabled, updated_at) '
+        . 'logo_url, attributes_json, properties_json, url_fields_json, enabled, updated_at) '
         . 'VALUES (:source_id, :name, :tvg_id, :tvg_name, :group_title, :language, :type, '
-        . ':logo_url, :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, :drm_headers, '
-        . ':attributes, :properties, :url_fields, :enabled, :updated_at) '
+        . ':logo_url, :attributes, :properties, :url_fields, :enabled, :updated_at) '
         . 'ON CONFLICT(source_id) DO UPDATE SET '
         . 'name = excluded.name, tvg_id = excluded.tvg_id, tvg_name = excluded.tvg_name, '
         . 'group_title = excluded.group_title, tvg_language = excluded.tvg_language, tvg_type = excluded.tvg_type, '
-        . 'logo_url = excluded.logo_url, stream_url = excluded.stream_url, '
+        . 'logo_url = excluded.logo_url, attributes_json = excluded.attributes_json, '
+        . 'updated_at = excluded.updated_at'
+    );
+    $insertFeed = $db->prepare(
+        'INSERT INTO feeds (channel_id, label, stream_url, license_key_url, drm_type, drm_key_id, drm_key, '
+        . 'drm_headers, properties_json, visibility, enabled, sort_order, updated_at) '
+        . "VALUES (:channel_id, '', :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, "
+        . ':drm_headers, :properties, :visibility, 1, :sort_order, :updated_at) '
+        . 'ON CONFLICT(channel_id, stream_url) DO UPDATE SET '
         . 'license_key_url = excluded.license_key_url, drm_type = excluded.drm_type, '
         . 'drm_key_id = excluded.drm_key_id, drm_key = excluded.drm_key, drm_headers = excluded.drm_headers, '
-        . 'attributes_json = excluded.attributes_json, properties_json = excluded.properties_json, '
-        . 'url_fields_json = excluded.url_fields_json, updated_at = excluded.updated_at'
+        . 'properties_json = excluded.properties_json, updated_at = excluded.updated_at'
     );
-    $exists = $db->prepare('SELECT 1 FROM channels WHERE source_id = :source_id');
+    $updateChannel = $db->prepare(
+        'UPDATE channels SET name = :name, tvg_id = :tvg_id, tvg_name = :tvg_name, '
+        . 'group_title = :group_title, tvg_language = :language, tvg_type = :type, '
+        . 'logo_url = :logo_url, attributes_json = :attributes, updated_at = :updated_at '
+        . 'WHERE id = :id'
+    );
+
+    $groups = [];
+    $skipped = 0;
+    foreach ($entries as $entry) {
+        $streamUrl = trim($entry['stream_url']);
+        $name = cleanGuideText($entry['name'] !== '' ? $entry['name'] : nameFromStreamUrl($streamUrl));
+        if ($streamUrl === '' || $name === '' || preg_match('#^[a-z][a-z0-9+.\-]*://#i', $streamUrl) !== 1) {
+            $skipped++;
+            continue;
+        }
+        $groups[$name][] = ['entry' => $entry, 'stream_url' => $streamUrl];
+    }
+    if ($groups === []) {
+        throw new RuntimeException('No importable channels were found in the playlist.');
+    }
 
     $added = 0;
     $updated = 0;
-    $skipped = 0;
     $now = gmdate('Y-m-d H:i:s');
 
     $db->beginTransaction();
     try {
-        foreach ($entries as $entry) {
-            $streamUrl = trim($entry['stream_url']);
-            $name = cleanGuideText($entry['name'] !== '' ? $entry['name'] : nameFromStreamUrl($streamUrl));
-            if ($streamUrl === '' || $name === '' || preg_match('#^[a-z][a-z0-9+.\-]*://#i', $streamUrl) !== 1) {
-                $skipped++;
-                continue;
+        foreach ($groups as $name => $group) {
+            $firstEntry = $group[0]['entry'];
+
+            $channelId = null;
+            $canonicalSourceId = 'm3u-' . sha1($name);
+            $findChannelBySourceId->execute(['source_id' => $canonicalSourceId]);
+            $canonicalMatch = $findChannelBySourceId->fetchColumn();
+            if ($canonicalMatch) {
+                $channelId = (int) $canonicalMatch;
+            }
+            if ($channelId === null) {
+                foreach ($group as $item) {
+                    $findChannelBySourceId->execute(['source_id' => 'm3u-' . sha1($name . "\0" . $item['stream_url'])]);
+                    $match = $findChannelBySourceId->fetchColumn();
+                    if ($match) {
+                        $channelId = (int) $match;
+                        break;
+                    }
+                }
+            }
+            if ($channelId === null) {
+                $findChannelsByName->execute(['name' => $name]);
+                $nameMatches = array_map(static fn (array $row): int => (int) $row['id'], $findChannelsByName->fetchAll());
+                if (count($nameMatches) === 1) {
+                    $channelId = $nameMatches[0];
+                }
             }
 
-            $attributes = $entry['attributes'];
-            $properties = $entry['properties'];
-            $drm = drmFieldsFromProperties($properties);
-            $sourceId = 'm3u-' . sha1($name . "\0" . $streamUrl);
+            $channelProperties = json_encode((object) $firstEntry['properties'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
+            $channelAttributes = (string) (json_encode((object) $firstEntry['attributes'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}');
 
-            $exists->execute(['source_id' => $sourceId]);
-            $alreadyExists = (bool) $exists->fetchColumn();
-
-            $insert->execute([
-                'source_id' => $sourceId,
-                'name' => $name,
-                'tvg_id' => (string) ($attributes['tvg-id'] ?? ''),
-                'tvg_name' => (string) ($attributes['tvg-name'] ?? ''),
-                'group_title' => $entry['group_title'],
-                'language' => (string) ($attributes['tvg-language'] ?? ''),
-                'type' => (string) ($attributes['tvg-type'] ?? ''),
-                'logo_url' => (string) ($attributes['tvg-logo'] ?? ''),
-                'stream_url' => $streamUrl,
-                'license_key_url' => $drm['license'],
-                'drm_type' => $drm['type'],
-                'drm_key_id' => $drm['key_id'],
-                'drm_key' => $drm['key'],
-                'drm_headers' => $drm['headers'],
-                'attributes' => (string) (json_encode((object) $attributes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
-                'properties' => (string) (json_encode((object) $properties, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
-                'url_fields' => '{}',
-                'enabled' => 1,
-                'updated_at' => $now,
-            ]);
-            if ($alreadyExists) {
-                $updated++;
-            } else {
+            if ($channelId === null) {
+                $insertChannel->execute([
+                    'source_id' => $canonicalSourceId,
+                    'name' => $name,
+                    'tvg_id' => (string) ($firstEntry['attributes']['tvg-id'] ?? ''),
+                    'tvg_name' => (string) ($firstEntry['attributes']['tvg-name'] ?? ''),
+                    'group_title' => $firstEntry['group_title'],
+                    'language' => (string) ($firstEntry['attributes']['tvg-language'] ?? ''),
+                    'type' => (string) ($firstEntry['attributes']['tvg-type'] ?? ''),
+                    'logo_url' => (string) ($firstEntry['attributes']['tvg-logo'] ?? ''),
+                    'attributes' => $channelAttributes,
+                    'properties' => $channelProperties,
+                    'url_fields' => '{}',
+                    'enabled' => 1,
+                    'updated_at' => $now,
+                ]);
+                $channelId = (int) $db->lastInsertId();
                 $added++;
+            } else {
+                $updateChannel->execute([
+                    'name' => $name,
+                    'tvg_id' => (string) ($firstEntry['attributes']['tvg-id'] ?? ''),
+                    'tvg_name' => (string) ($firstEntry['attributes']['tvg-name'] ?? ''),
+                    'group_title' => $firstEntry['group_title'],
+                    'language' => (string) ($firstEntry['attributes']['tvg-language'] ?? ''),
+                    'type' => (string) ($firstEntry['attributes']['tvg-type'] ?? ''),
+                    'logo_url' => (string) ($firstEntry['attributes']['tvg-logo'] ?? ''),
+                    'attributes' => $channelAttributes,
+                    'updated_at' => $now,
+                    'id' => $channelId,
+                ]);
+                $updated++;
+            }
+
+            foreach ($group as $position => $item) {
+                $entry = $item['entry'];
+                $drm = drmFieldsFromProperties($entry['properties']);
+                $insertFeed->execute([
+                    'channel_id' => $channelId,
+                    'stream_url' => $item['stream_url'],
+                    'license_key_url' => $drm['license'],
+                    'drm_type' => $drm['type'],
+                    'drm_key_id' => $drm['key_id'],
+                    'drm_key' => $drm['key'],
+                    'drm_headers' => $drm['headers'],
+                    'properties' => (string) (json_encode((object) $entry['properties'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}'),
+                    'visibility' => 'both',
+                    'sort_order' => $position,
+                    'updated_at' => $now,
+                ]);
             }
         }
         $db->commit();

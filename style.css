@@ -80,6 +80,24 @@ h2 { margin-bottom: 4px; font-size: 18px; }
 .category-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .category-empty { padding: 26px; }
 .category-note { margin: 0; padding: 14px 26px; border-top: 1px solid #edf0f4; font-size: 11px; }
+.form-section-head { margin: 26px 0 0; padding-top: 20px; border-top: 1px solid #edf0f4; }
+.form-section-head h3 { margin: 0 0 4px; font-size: 14px; }
+.form-section-head .muted { font-size: 11px; }
+.feed-card { margin: 18px 26px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #fcfdff; }
+.feed-card-head { padding: 12px 16px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid #edf0f4; background: #f7f9fc; }
+.feed-card-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.feed-card-title strong { color: #283447; font-size: 13px; }
+.feed-actions { display: flex; align-items: center; gap: 4px; }
+.feed-card .channel-edit-form { padding: 18px 16px; }
+.add-feed-card { background: var(--surface); }
+.add-feed-card h3 { margin: 0; padding: 16px 16px 0; font-size: 14px; }
+.feed-chip { display: inline-block; padding: 2px 7px; border-radius: 20px; background: #eef1f7; color: #526076; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+.feed-chip.drm-chip { color: #8a5a12; background: #fff3dd; }
+.feed-chip.muted-chip { color: #9aa3b1; background: #f1f3f8; }
+.feed-chips { display: inline-flex; flex-wrap: wrap; gap: 3px; margin-top: 3px; }
+.feeds-cell { min-width: 110px; }
+.feeds-cell strong { display: block; color: #283447; font-size: 11px; }
+.feed-warning { margin: 14px 0 0; padding: 8px 11px; border-radius: 8px; color: #8a5a12; background: #fff3dd; font-size: 11px; }
 .table-card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 3px 14px #1b2a4406; overflow: visible; }
 .table-toolbar { min-height: 86px; padding: 17px 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); }
 .table-toolbar .muted { font-size: 12px; }

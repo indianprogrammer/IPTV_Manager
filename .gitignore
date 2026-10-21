@@ -4,6 +4,7 @@
 /data/cache/
 /data/*.pid
 /data/*.log
+/data/*.bak
 
 .env
 

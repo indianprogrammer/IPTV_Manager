@@ -166,17 +166,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $properties = parseChannelProperties((string) ($_POST['properties'] ?? ''));
             $licenseKeyUrl = trim((string) ($_POST['license_key_url'] ?? ''));
             $drm = readDrmFields($_POST, $licenseKeyUrl);
+            $visibility = normalizeFeedVisibility((string) ($_POST['visibility'] ?? 'both'));
             $encodedProperties = json_encode((object) $properties, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             if ($encodedProperties === false) {
                 throw new RuntimeException('Unable to encode the KODIPROP properties.');
             }
             $statement = $db->prepare(
                 'INSERT INTO channels (source_id, name, tvg_id, tvg_name, group_title, tvg_language, tvg_type, '
-                . 'logo_url, stream_url, license_key_url, drm_type, drm_key_id, drm_key, drm_headers, '
-                . 'attributes_json, properties_json, url_fields_json, enabled, updated_at) '
+                . 'logo_url, attributes_json, properties_json, url_fields_json, enabled, updated_at) '
                 . 'VALUES (:source_id, :name, :tvg_id, :tvg_name, :group_title, :language, :type, '
-                . ':logo_url, :stream_url, :license_key_url, :drm_type, :drm_key_id, :drm_key, :drm_headers, '
-                . ':attributes, :properties, :url_fields, :enabled, :updated_at)'
+                . ':logo_url, :attributes, :properties, :url_fields, :enabled, :updated_at)'
             );
             $statement->execute([
                 'source_id' => 'manual-' . bin2hex(random_bytes(8)),
@@ -187,17 +186,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'language' => trim((string) ($_POST['tvg_language'] ?? '')),
                 'type' => trim((string) ($_POST['tvg_type'] ?? '')),
                 'logo_url' => trim((string) ($_POST['logo_url'] ?? '')),
-                'stream_url' => $streamUrl,
-                'license_key_url' => $licenseKeyUrl,
-                'drm_type' => $drm['type'],
-                'drm_key_id' => $drm['key_id'],
-                'drm_key' => $drm['key'],
-                'drm_headers' => $drm['headers'],
                 'attributes' => '{}',
                 'properties' => $encodedProperties,
                 'url_fields' => '{}',
                 'enabled' => isset($_POST['enabled']) ? 1 : 0,
                 'updated_at' => gmdate('Y-m-d H:i:s'),
+            ]);
+            insertFeed($db, (int) $db->lastInsertId(), [
+                'label' => trim((string) ($_POST['feed_label'] ?? '')),
+                'stream_url' => $streamUrl,
+                'license' => $licenseKeyUrl,
+                'drm' => $drm,
+                'properties' => $properties,
+                'visibility' => $visibility,
+                'enabled' => 1,
+                'sort_order' => 0,
             ]);
             bumpCacheVersion($db);
             flash('Channel added.');
@@ -207,15 +210,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($name === '') {
                 throw new RuntimeException('Channel name is required.');
             }
-            $properties = parseChannelProperties((string) ($_POST['properties'] ?? ''));
-            $licenseKeyUrl = trim((string) ($_POST['license_key_url'] ?? ''));
-            $drm = readDrmFields($_POST, $licenseKeyUrl);
             $statement = $db->prepare(
                 'UPDATE channels SET name = :name, tvg_id = :tvg_id, tvg_name = :tvg_name, '
                 . 'group_title = :group_title, tvg_language = :language, tvg_type = :type, '
-                . 'logo_url = :logo_url, stream_url = :stream_url, license_key_url = :license_key_url, '
-                . 'drm_type = :drm_type, drm_key_id = :drm_key_id, drm_key = :drm_key, drm_headers = :drm_headers, '
-                . 'properties_json = :properties, enabled = :enabled, updated_at = :updated_at '
+                . 'logo_url = :logo_url, enabled = :enabled, updated_at = :updated_at '
                 . 'WHERE id = :id'
             );
             $statement->execute([
@@ -226,18 +224,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'language' => trim((string) ($_POST['tvg_language'] ?? '')),
                 'type' => trim((string) ($_POST['tvg_type'] ?? '')),
                 'logo_url' => trim((string) ($_POST['logo_url'] ?? '')),
-                'stream_url' => trim((string) ($_POST['stream_url'] ?? '')),
-                'license_key_url' => $licenseKeyUrl,
-                'drm_type' => $drm['type'],
-                'drm_key_id' => $drm['key_id'],
-                'drm_key' => $drm['key'],
-                'drm_headers' => $drm['headers'],
-                'properties' => json_encode((object) $properties, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}',
                 'enabled' => isset($_POST['enabled']) ? 1 : 0,
                 'updated_at' => gmdate('Y-m-d H:i:s'),
                 'id' => filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT),
             ]);
             flash('Channel details saved.');
+        } elseif ($action === 'feed_create' || $action === 'feed_update') {
+            $isCreate = $action === 'feed_create';
+            $channelId = (int) filter_input(INPUT_POST, 'channel_id', FILTER_VALIDATE_INT);
+            $feedId = (int) filter_input(INPUT_POST, 'feed_id', FILTER_VALIDATE_INT);
+            if (!$isCreate) {
+                $feedStatement = $db->prepare('SELECT id, channel_id FROM feeds WHERE id = :id');
+                $feedStatement->execute(['id' => $feedId]);
+                $feedRow = $feedStatement->fetch();
+                if (!$feedRow) {
+                    throw new RuntimeException('Feed not found.');
+                }
+                $channelId = (int) $feedRow['channel_id'];
+            }
+            $channelStatement = $db->prepare('SELECT id, name FROM channels WHERE id = :id');
+            $channelStatement->execute(['id' => $channelId]);
+            $channelRow = $channelStatement->fetch();
+            if (!$channelRow) {
+                throw new RuntimeException('Channel not found.');
+            }
+            $streamUrl = trim((string) ($_POST['stream_url'] ?? ''));
+            if ($streamUrl === '') {
+                throw new RuntimeException('Stream URL is required.');
+            }
+            $duplicateStatement = $db->prepare(
+                'SELECT id FROM feeds WHERE channel_id = :channel_id AND stream_url = :stream_url AND id != :id'
+            );
+            $duplicateStatement->execute([
+                'channel_id' => $channelId,
+                'stream_url' => $streamUrl,
+                'id' => $isCreate ? -1 : $feedId,
+            ]);
+            if ($duplicateStatement->fetchColumn()) {
+                throw new RuntimeException('This channel already has a feed with that stream URL.');
+            }
+            $properties = parseChannelProperties((string) ($_POST['properties'] ?? ''));
+            $licenseKeyUrl = trim((string) ($_POST['license_key_url'] ?? ''));
+            $drm = readDrmFields($_POST, $licenseKeyUrl);
+            $visibility = normalizeFeedVisibility((string) ($_POST['visibility'] ?? 'both'));
+            $feedData = [
+                'label' => trim((string) ($_POST['feed_label'] ?? '')),
+                'stream_url' => $streamUrl,
+                'license' => $licenseKeyUrl,
+                'drm' => $drm,
+                'properties' => $properties,
+                'visibility' => $visibility,
+            ];
+            if ($isCreate) {
+                $maxSort = (int) $db->query('SELECT COALESCE(MAX(sort_order), -1) + 1 FROM feeds WHERE channel_id = ' . $channelId)->fetchColumn();
+                $feedData['enabled'] = 1;
+                $feedData['sort_order'] = max(0, $maxSort);
+                insertFeed($db, $channelId, $feedData);
+                flash('Feed added to ' . $channelRow['name'] . '.');
+            } else {
+                updateFeed($db, $feedId, $feedData);
+                flash('Feed saved.');
+            }
+        } elseif ($action === 'feed_delete') {
+            $statement = $db->prepare('DELETE FROM feeds WHERE id = :id');
+            $statement->execute(['id' => filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT)]);
+            flash('Feed deleted.');
+        } elseif ($action === 'feed_toggle') {
+            $statement = $db->prepare('UPDATE feeds SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id = :id');
+            $statement->execute(['id' => filter_input(INPUT_POST, 'id', FILTER_VALIDATE_INT)]);
+            flash('Feed status updated.');
         } elseif ($action === 'category_rename') {
             $oldName = trim((string) ($_POST['old_name'] ?? ''));
             $newName = trim((string) ($_POST['name'] ?? ''));
@@ -342,6 +397,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         'date' => $_GET['date'] ?? null,
         'guide_category' => $_GET['guide_category'] ?? null,
         'guide_page' => $_GET['guide_page'] ?? null,
+        'edit' => isset($_GET['edit']) ? (string) max(0, (int) $_GET['edit']) : null,
     ], static fn ($value): bool => is_string($value) && $value !== ''));
     redirect('index.php' . ($query !== '' ? '?' . $query : ''));
 }
@@ -356,12 +412,18 @@ function h(?string $value): string
     return htmlspecialchars($value ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
-function postButton(string $action, int $id, string $label, string $class = '', string $icon = ''): string
+function postButton(string $action, int $id, string $label, string $class = '', string $icon = '', string $confirm = ''): string
 {
     $attributes = $icon !== '' ? ' title="' . h($label) . '" aria-label="' . h($label) . '"' : '';
     $content = $icon !== '' ? $icon : h($label);
+    $confirmJs = 'true';
+    if ($confirm !== '') {
+        $confirmJs = "confirm('" . addslashes($confirm) . "')";
+    } elseif ($action === 'delete') {
+        $confirmJs = "confirm('Delete this channel?')";
+    }
     return '<form method="post" class="inline-form" onsubmit="return '
-        . ($action === 'delete' ? "confirm('Delete this channel?')" : 'true')
+        . $confirmJs
         . '"><input type="hidden" name="csrf" value="' . h(csrfToken()) . '">'
         . '<input type="hidden" name="action" value="' . h($action) . '">'
         . '<input type="hidden" name="id" value="' . $id . '">'
@@ -383,32 +445,32 @@ function playIcon(): string
     return '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><path d="M8 5v14l11-7Z"/></svg>';
 }
 
-function channelPreviewData(array $channel): array
+function channelPreviewData(array $row, string $name): array
 {
-    $drm = channelDrmSettings($channel);
+    $drm = channelDrmSettings($row);
     $headers = [];
     try {
-        $headers = parseDrmHeaders((string) ($channel['drm_headers'] ?? ''));
+        $headers = parseDrmHeaders((string) ($row['drm_headers'] ?? ''));
     } catch (RuntimeException) {
         $headers = [];
     }
     if ($headers === []) {
-        $properties = json_decode((string) ($channel['properties_json'] ?? ''), true);
+        $properties = json_decode((string) ($row['properties_json'] ?? ''), true);
         $licenseProperty = is_array($properties) ? ($properties['inputstream.adaptive.license_key'] ?? '') : '';
         if (is_string($licenseProperty)) {
             $segments = explode('|', $licenseProperty);
             if (isset($segments[1]) && $segments[1] !== '') {
                 parse_str($segments[1], $parsedHeaders);
-                foreach ($parsedHeaders as $name => $value) {
-                    if (is_string($name) && is_string($value)) {
-                        $headers[$name] = $value;
+                foreach ($parsedHeaders as $headerName => $value) {
+                    if (is_string($headerName) && is_string($value)) {
+                        $headers[$headerName] = $value;
                     }
                 }
             }
         }
     }
 
-    $path = parse_url((string) ($channel['stream_url'] ?? ''), PHP_URL_PATH);
+    $path = parse_url((string) ($row['stream_url'] ?? ''), PHP_URL_PATH);
     $extension = strtolower(pathinfo(is_string($path) ? $path : '', PATHINFO_EXTENSION));
     $mime = match ($extension) {
         'm3u8' => 'application/x-mpegURL',
@@ -420,8 +482,8 @@ function channelPreviewData(array $channel): array
     };
 
     return [
-        'name' => (string) ($channel['name'] ?? ''),
-        'src' => (string) ($channel['stream_url'] ?? ''),
+        'name' => $name,
+        'src' => (string) ($row['stream_url'] ?? ''),
         'mime' => $mime,
         'drmType' => $drm['type'],
         'licenseUrl' => $drm['license'],
@@ -440,6 +502,89 @@ function statusButton(int $id, bool $enabled): string
         . '<input type="hidden" name="id" value="' . $id . '">'
         . '<button class="status-dot ' . ($enabled ? 'enabled' : 'disabled') . '" type="submit" title="' . h($label) . '" aria-label="' . h($label) . '"></button>'
         . '</form>';
+}
+
+function feedStatusButton(int $id, bool $enabled): string
+{
+    $label = $enabled ? 'Disable feed' : 'Enable feed';
+    return '<form method="post" class="status-form">'
+        . '<input type="hidden" name="csrf" value="' . h(csrfToken()) . '">'
+        . '<input type="hidden" name="action" value="feed_toggle">'
+        . '<input type="hidden" name="id" value="' . $id . '">'
+        . '<button class="status-dot ' . ($enabled ? 'enabled' : 'disabled') . '" type="submit" title="' . h($label) . '" aria-label="' . h($label) . '"></button>'
+        . '</form>';
+}
+
+function feedVisibilityLabels(): array
+{
+    return [
+        'playlist' => 'Playlist server only',
+        'clear' => 'Clear server only',
+        'both' => 'Both servers',
+    ];
+}
+
+function feedVisibilitySelect(string $selected): string
+{
+    $html = '<select name="visibility">';
+    foreach (feedVisibilityLabels() as $value => $label) {
+        $html .= '<option value="' . h($value) . '"' . ($value === $selected ? ' selected' : '') . '>' . h($label) . '</option>';
+    }
+    return $html . '</select>';
+}
+
+function feedVisibilityShort(string $visibility): string
+{
+    return match ($visibility) {
+        'playlist' => 'playlist',
+        'clear' => 'clear',
+        'both' => 'both',
+        default => $visibility,
+    };
+}
+
+function feedPropertiesText(array $feed): string
+{
+    $lines = '';
+    $properties = json_decode((string) ($feed['properties_json'] ?? ''), true);
+    if (is_array($properties)) {
+        foreach ($properties as $name => $value) {
+            if (is_string($name) && is_string($value)) {
+                $lines .= $name . '=' . $value . "\n";
+            }
+        }
+    }
+    return rtrim($lines);
+}
+
+function feedFormFields(array $feed, string $propertiesText, string $visibility): string
+{
+    $drm = channelDrmSettings($feed);
+    $drmTypes = ['' => 'None / KODIPROP only', 'clearkey' => 'ClearKey', 'widevine' => 'Widevine', 'playready' => 'PlayReady'];
+    $drmSelect = '<select name="drm_type">';
+    foreach ($drmTypes as $value => $label) {
+        $drmSelect .= '<option value="' . h($value) . '"' . (($drm['type'] ?? '') === $value ? ' selected' : '') . '>' . h($label) . '</option>';
+    }
+    $drmSelect .= '</select>';
+
+    return '<label>Feed label<input name="feed_label" value="' . h((string) ($feed['label'] ?? '')) . '" placeholder="Optional, e.g. HD"></label>'
+        . '<label>Visible on' . feedVisibilitySelect($visibility) . '<small>The playlist server serves feeds assigned to "playlist" or "both"; the clear server serves "clear" or "both".</small></label>'
+        . '<label class="span-2">Stream URL<input name="stream_url" value="' . h((string) ($feed['stream_url'] ?? '')) . '" required></label>'
+        . '<label class="span-2">License key URL<input name="license_key_url" value="' . h((string) ($drm['license'] ?? '')) . '"></label>'
+        . '<label>DRM type' . $drmSelect . '<small>Widevine and PlayReady require a license URL.</small></label>'
+        . '<label>DRM license headers<textarea name="drm_headers" rows="2" spellcheck="false" placeholder="Authorization: Bearer token">' . h((string) ($feed['drm_headers'] ?? '')) . '</textarea><small>One Name: value header per line, sent with license requests.</small></label>'
+        . '<label>ClearKey key ID<input name="drm_key_id" value="' . h((string) ($drm['key_id'] ?? '')) . '" placeholder="32 hex characters"></label>'
+        . '<label>ClearKey key<input name="drm_key" value="' . h((string) ($drm['key'] ?? '')) . '" placeholder="32 hex characters"></label>'
+        . '<label class="span-2">KODIPROP properties<textarea name="properties" rows="6" spellcheck="false" placeholder="inputstream.adaptive.manifest_type=mpd">' . h($propertiesText) . '</textarea><small>One name=value pair per line. These become #KODIPROP entries in the playlist. Dedicated DRM fields override matching keys.</small></label>';
+}
+
+function feedDrmWarning(array $feed): string
+{
+    $visibility = (string) ($feed['visibility'] ?? 'both');
+    if (!channelHasDrm($feed) || $visibility === 'playlist') {
+        return '';
+    }
+    return '<p class="feed-warning">This feed has DRM settings but is visible on the clear server.</p>';
 }
 
 ?><!doctype html>
@@ -480,7 +625,8 @@ function statusButton(int $id, bool $enabled): string
     $where = [];
     $parameters = [];
     if ($search !== '') {
-        $where[] = '(name LIKE :search OR tvg_id LIKE :search OR group_title LIKE :search OR stream_url LIKE :search)';
+        $where[] = '(name LIKE :search OR tvg_id LIKE :search OR group_title LIKE :search '
+            . 'OR EXISTS (SELECT 1 FROM feeds f WHERE f.channel_id = channels.id AND f.stream_url LIKE :search))';
         $parameters['search'] = '%' . $search . '%';
     }
     if ($category !== '') {
@@ -490,7 +636,7 @@ function statusButton(int $id, bool $enabled): string
     $whereSql = $where ? ' WHERE ' . implode(' AND ', $where) : '';
     $listData = databaseCache(
         $db,
-        'v1:channels:' . sha1((string) json_encode([$search, $category, $page, $pageSize])),
+        'v2:channels:' . sha1((string) json_encode([$search, $category, $page, $pageSize])),
         static function () use ($db, $whereSql, $parameters, $page, $pageSize): array {
             $countStatement = $db->prepare('SELECT COUNT(*) FROM channels' . $whereSql);
             $countStatement->execute($parameters);
@@ -520,6 +666,19 @@ function statusButton(int $id, bool $enabled): string
     $totalPages = (int) $listData['total_pages'];
     $page = (int) $listData['page'];
     $channels = $listData['channels'];
+
+    $feedSummaries = [];
+    if ($channels !== []) {
+        $channelIds = array_map(static fn (array $channel): int => (int) $channel['id'], $channels);
+        $placeholders = implode(',', array_fill(0, count($channelIds), '?'));
+        $feedStatement = $db->prepare(
+            'SELECT * FROM feeds WHERE channel_id IN (' . $placeholders . ') ORDER BY sort_order, id'
+        );
+        $feedStatement->execute($channelIds);
+        foreach ($feedStatement->fetchAll() as $feedRow) {
+            $feedSummaries[(int) $feedRow['channel_id']][] = $feedRow;
+        }
+    }
 
     $categoryRows = databaseCache(
         $db,
@@ -695,20 +854,9 @@ function statusButton(int $id, bool $enabled): string
         $listParams['page'] = $page;
     }
     $listUrl = 'index.php' . ($listParams !== [] ? '?' . http_build_query($listParams) : '');
-    $editProperties = '';
-    $editDrm = ['type' => '', 'license' => '', 'key_id' => '', 'key' => '', 'headers' => ''];
+    $editFeeds = [];
     if ($editChannel) {
-        $decodedProperties = json_decode((string) $editChannel['properties_json'], true);
-        if (is_array($decodedProperties)) {
-            foreach ($decodedProperties as $propertyName => $propertyValue) {
-                if (is_string($propertyName) && is_string($propertyValue)) {
-                    $editProperties .= $propertyName . '=' . $propertyValue . "\n";
-                }
-            }
-        }
-        $editProperties = rtrim($editProperties);
-        $editDrm = channelDrmSettings($editChannel);
-        $editDrm['headers'] = (string) ($editChannel['drm_headers'] ?? '');
+        $editFeeds = feedsForChannel($db, (int) $editChannel['id']);
     }
     ?>
     <header class="topbar">
@@ -862,7 +1010,7 @@ function statusButton(int $id, bool $enabled): string
                     <div>
                         <p class="eyebrow">ADD CHANNEL</p>
                         <h2>New channel</h2>
-                        <p class="muted">Add a channel manually. TVG fields and KODIPROP properties are written to the generated playlist.</p>
+                        <p class="muted">Add a channel and its first feed. TVG fields and KODIPROP properties are written to the generated playlist. You can add more feeds after saving.</p>
                     </div>
                     <a class="button secondary" href="index.php">Back to channels</a>
                 </div>
@@ -877,19 +1025,14 @@ function statusButton(int $id, bool $enabled): string
                         <label>Language<input name="tvg_language"></label>
                         <label>Type<input name="tvg_type"></label>
                         <label class="span-2">Logo URL<input name="logo_url"></label>
-                        <label class="span-2">Stream URL<input name="stream_url" required></label>
-                        <label class="span-2">License key URL<input name="license_key_url"></label>
-                        <label>DRM type<select name="drm_type">
-                            <option value="">None / KODIPROP only</option>
-                            <option value="clearkey">ClearKey</option>
-                            <option value="widevine">Widevine</option>
-                            <option value="playready">PlayReady</option>
-                        </select><small>Widevine and PlayReady require a license URL.</small></label>
-                        <label>DRM license headers<textarea name="drm_headers" rows="2" spellcheck="false" placeholder="Authorization: Bearer token"></textarea><small>One Name: value header per line, sent with license requests.</small></label>
-                        <label>ClearKey key ID<input name="drm_key_id" placeholder="32 hex characters"></label>
-                        <label>ClearKey key<input name="drm_key" placeholder="32 hex characters"></label>
-                        <label class="span-2">KODIPROP properties<textarea name="properties" rows="6" spellcheck="false" placeholder="inputstream.adaptive.manifest_type=mpd"></textarea><small>One name=value pair per line. These become #KODIPROP entries in the playlist.</small></label>
-                        <label class="checkbox-label"><input type="checkbox" name="enabled" value="1" checked> Include in playlist</label>
+                        <label class="checkbox-label"><input type="checkbox" name="enabled" value="1" checked> Include channel in playlist</label>
+                    </div>
+                    <div class="form-section-head">
+                        <h3>First feed</h3>
+                        <p class="muted">A channel needs at least one feed to appear in a playlist. Add more feeds after saving the channel.</p>
+                    </div>
+                    <div class="form-grid">
+                        <?= feedFormFields([], '', 'both') ?>
                     </div>
                     <div class="form-actions">
                         <button class="button primary" type="submit">Add channel</button>
@@ -908,7 +1051,7 @@ function statusButton(int $id, bool $enabled): string
                     <div>
                         <p class="eyebrow">IMPORT PLAYLIST</p>
                         <h2>Import M3U playlist</h2>
-                        <p class="muted">Upload an M3U/M3U8 file or enter a playlist URL. Channels with the same name and stream URL are updated in place; channels you disabled stay disabled. #KODIPROP DRM settings are mapped to the dedicated DRM fields automatically.</p>
+                        <p class="muted">Upload an M3U/M3U8 file or enter a playlist URL. Entries with the same channel name become feeds of one channel; existing feeds keep their visible-on and enabled settings. #KODIPROP DRM settings are mapped to the dedicated DRM fields automatically.</p>
                     </div>
                     <a class="button secondary" href="index.php">Back to channels</a>
                 </div>
@@ -932,7 +1075,7 @@ function statusButton(int $id, bool $enabled): string
                     <div>
                         <p class="eyebrow">EDIT CHANNEL</p>
                         <h2><?= h($editChannel['name']) ?></h2>
-                        <p class="muted">Update every property written to the generated playlist.</p>
+                        <p class="muted">Update the channel details shared by all of its feeds.</p>
                     </div>
                     <a class="button secondary" href="<?= h($listUrl) ?>">Back to channels</a>
                 </div>
@@ -948,19 +1091,7 @@ function statusButton(int $id, bool $enabled): string
                         <label>Language<input name="tvg_language" value="<?= h($editChannel['tvg_language']) ?>"></label>
                         <label>Type<input name="tvg_type" value="<?= h($editChannel['tvg_type']) ?>"></label>
                         <label class="span-2">Logo URL<input name="logo_url" value="<?= h($editChannel['logo_url']) ?>"></label>
-                        <label class="span-2">Stream URL<input name="stream_url" value="<?= h($editChannel['stream_url']) ?>"></label>
-                        <label class="span-2">License key URL<input name="license_key_url" value="<?= h($editDrm['license']) ?>"></label>
-                        <label>DRM type<select name="drm_type">
-                            <option value="" <?= $editDrm['type'] === '' ? 'selected' : '' ?>>None / KODIPROP only</option>
-                            <option value="clearkey" <?= $editDrm['type'] === 'clearkey' ? 'selected' : '' ?>>ClearKey</option>
-                            <option value="widevine" <?= $editDrm['type'] === 'widevine' ? 'selected' : '' ?>>Widevine</option>
-                            <option value="playready" <?= $editDrm['type'] === 'playready' ? 'selected' : '' ?>>PlayReady</option>
-                        </select><small>Widevine and PlayReady require a license URL.</small></label>
-                        <label>DRM license headers<textarea name="drm_headers" rows="2" spellcheck="false" placeholder="Authorization: Bearer token"><?= h($editDrm['headers']) ?></textarea><small>One Name: value header per line, sent with license requests.</small></label>
-                        <label>ClearKey key ID<input name="drm_key_id" value="<?= h($editDrm['key_id']) ?>" placeholder="32 hex characters"></label>
-                        <label>ClearKey key<input name="drm_key" value="<?= h($editDrm['key']) ?>" placeholder="32 hex characters"></label>
-                        <label class="span-2">KODIPROP properties<textarea name="properties" rows="6" spellcheck="false" placeholder="inputstream.adaptive.manifest_type=mpd"><?= h($editProperties) ?></textarea><small>One name=value pair per line. These become #KODIPROP entries in the playlist. Dedicated DRM fields override matching keys.</small></label>
-                        <label class="checkbox-label"><input type="checkbox" name="enabled" value="1" <?= $editChannel['enabled'] ? 'checked' : '' ?>> Include in playlist</label>
+                        <label class="checkbox-label"><input type="checkbox" name="enabled" value="1" <?= $editChannel['enabled'] ? 'checked' : '' ?>> Include channel in playlist</label>
                     </div>
                     <div class="form-actions">
                         <button class="button primary" type="submit">Save changes</button>
@@ -972,6 +1103,69 @@ function statusButton(int $id, bool $enabled): string
                         <option value="<?= h((string) $item) ?>"></option>
                     <?php endforeach; ?>
                 </datalist>
+            </section>
+            <section class="form-card feeds-card">
+                <div class="form-card-head">
+                    <div>
+                        <p class="eyebrow">CHANNEL FEEDS</p>
+                        <h2>Feeds</h2>
+                        <p class="muted">Each feed is one stream for this channel. A feed can be encrypted or clear, and you choose which server serves it.</p>
+                    </div>
+                </div>
+                <?php if (!$editFeeds): ?>
+                    <p class="category-empty muted">No feeds yet. Add one below so this channel appears in a playlist.</p>
+                <?php endif; ?>
+                <?php foreach ($editFeeds as $feedIndex => $feed): ?>
+                    <?php
+                    $feedVisibility = (string) $feed['visibility'];
+                    $feedLabel = trim((string) $feed['label']);
+                    $feedTitle = $feedLabel !== '' ? $feedLabel : 'Feed ' . ($feedIndex + 1);
+                    $previewName = (string) $editChannel['name'] . ($feedLabel !== '' ? ' · ' . $feedLabel : '');
+                    $feedPreview = json_encode(channelPreviewData($feed, $previewName), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{}';
+                    ?>
+                    <article class="feed-card">
+                        <header class="feed-card-head">
+                            <div class="feed-card-title">
+                                <?= feedStatusButton((int) $feed['id'], (bool) $feed['enabled']) ?>
+                                <strong><?= h($feedTitle) ?></strong>
+                                <span class="feed-chip"><?= h(feedVisibilityShort($feedVisibility)) ?></span>
+                                <?php if (channelHasDrm($feed)): ?><span class="feed-chip drm-chip">encrypted</span><?php endif; ?>
+                                <?php if (!(int) $feed['enabled']): ?><span class="feed-chip muted-chip">disabled</span><?php endif; ?>
+                            </div>
+                            <div class="feed-actions">
+                                <button class="button small-button icon-button preview-button" type="button" data-preview="<?= h($feedPreview) ?>" title="Preview <?= h($feedTitle) ?>" aria-label="Preview <?= h($feedTitle) ?>"><?= playIcon() ?></button>
+                                <?= postButton('feed_delete', (int) $feed['id'], 'Delete feed', 'small-button danger-button icon-button', deleteIcon(), 'Delete this feed?') ?>
+                            </div>
+                        </header>
+                        <form method="post" class="channel-edit-form">
+                            <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                            <input type="hidden" name="action" value="feed_update">
+                            <input type="hidden" name="feed_id" value="<?= (int) $feed['id'] ?>">
+                            <input type="hidden" name="channel_id" value="<?= (int) $editChannel['id'] ?>">
+                            <div class="form-grid">
+                                <?= feedFormFields($feed, feedPropertiesText($feed), $feedVisibility) ?>
+                            </div>
+                            <?= feedDrmWarning($feed) ?>
+                            <div class="form-actions">
+                                <button class="button primary" type="submit">Save feed</button>
+                            </div>
+                        </form>
+                    </article>
+                <?php endforeach; ?>
+                <article class="feed-card add-feed-card">
+                    <h3>Add feed</h3>
+                    <form method="post" class="channel-edit-form">
+                        <input type="hidden" name="csrf" value="<?= h(csrfToken()) ?>">
+                        <input type="hidden" name="action" value="feed_create">
+                        <input type="hidden" name="channel_id" value="<?= (int) $editChannel['id'] ?>">
+                        <div class="form-grid">
+                            <?= feedFormFields([], '', 'both') ?>
+                        </div>
+                        <div class="form-actions">
+                            <button class="button primary" type="submit">Add feed</button>
+                        </div>
+                    </form>
+                </article>
             </section>
         <?php elseif ($manageCategories): ?>
             <section class="form-card">
@@ -1046,7 +1240,7 @@ function statusButton(int $id, bool $enabled): string
                     <thead><tr>
                         <th class="select-cell"><input type="checkbox" class="bulk-select-all" title="Select all channels on this page" aria-label="Select all channels on this page"></th>
                         <th>Channel</th><th>ID</th><th>Category</th><th>Language</th><th>Type</th>
-                        <th>Logo URL</th><th>Stream URL</th><th>License URL</th>
+                        <th>Logo URL</th><th>Feeds</th>
                         <?php foreach ($visibleUrlColumns as $field): ?>
                             <th><?= h($field) ?></th>
                         <?php endforeach; ?>
@@ -1054,14 +1248,27 @@ function statusButton(int $id, bool $enabled): string
                     </tr></thead>
                     <tbody>
                     <?php if (!$channels): ?>
-                        <tr><td colspan="<?= 10 + count($visibleUrlColumns) ?>" class="empty-state">
+                        <tr><td colspan="<?= 9 + count($visibleUrlColumns) ?>" class="empty-state">
                             <strong>No channels found</strong>
                             <span><?= (int) $stats['total'] === 0 ? 'Add a channel to start building your playlist.' : 'Try a different search or category.' ?></span>
                             <?php if ((int) $stats['total'] === 0): ?><a class="button secondary small-button empty-action" href="index.php?add=1">Add channel</a><?php endif; ?>
                         </td></tr>
                     <?php endif; ?>
                     <?php foreach ($channels as $channel): ?>
-                        <?php $urls = json_decode($channel['url_fields_json'], true) ?: []; ?>
+                        <?php
+                        $urls = json_decode($channel['url_fields_json'], true) ?: [];
+                        $channelFeeds = $feedSummaries[(int) $channel['id']] ?? [];
+                        $previewFeed = null;
+                        foreach ($channelFeeds as $candidateFeed) {
+                            if ((int) $candidateFeed['enabled'] === 1) {
+                                $previewFeed = $candidateFeed;
+                                break;
+                            }
+                        }
+                        $previewData = $previewFeed !== null
+                            ? json_encode(channelPreviewData($previewFeed, (string) $channel['name']), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT)
+                            : false;
+                        ?>
                         <tr>
                             <td class="select-cell"><input type="checkbox" class="bulk-checkbox" name="ids[]" value="<?= (int) $channel['id'] ?>" form="bulk-delete-form" aria-label="Select <?= h($channel['name']) ?>"></td>
                             <td><div class="channel-cell">
@@ -1074,14 +1281,25 @@ function statusButton(int $id, bool $enabled): string
                             <td><?= h($channel['tvg_language']) ?></td>
                             <td><?= h($channel['tvg_type']) ?></td>
                             <td class="url-cell"><?= urlLink($channel['logo_url']) ?></td>
-                            <td class="url-cell"><?= urlLink($channel['stream_url']) ?></td>
-                            <td class="url-cell"><?= urlLink($channel['license_key_url']) ?></td>
+                            <td class="feeds-cell">
+                                <?php if (!$channelFeeds): ?>
+                                    <span class="empty-value">No feeds</span>
+                                <?php else: ?>
+                                    <strong><?= count($channelFeeds) ?> feed<?= count($channelFeeds) === 1 ? '' : 's' ?></strong>
+                                    <span class="feed-chips">
+                                        <?php foreach (array_unique(array_map(static fn (array $feedRow): string => (string) $feedRow['visibility'], $channelFeeds)) as $visibility): ?>
+                                            <span class="feed-chip"><?= h(feedVisibilityShort($visibility)) ?></span>
+                                        <?php endforeach; ?>
+                                    </span>
+                                <?php endif; ?>
+                            </td>
                             <?php foreach ($visibleUrlColumns as $field): ?>
                                 <td class="url-cell"><?= urlLink(is_string($urls[$field] ?? null) ? $urls[$field] : '') ?></td>
                             <?php endforeach; ?>
                             <td><div class="manage-cell">
-                                <?php $previewData = json_encode(channelPreviewData($channel), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{}'; ?>
-                                <button class="button small-button icon-button preview-button" type="button" data-preview="<?= h($previewData) ?>" title="Preview <?= h($channel['name']) ?>" aria-label="Preview <?= h($channel['name']) ?>"><?= playIcon() ?></button>
+                                <?php if ($previewData !== false): ?>
+                                    <button class="button small-button icon-button preview-button" type="button" data-preview="<?= h($previewData) ?>" title="Preview <?= h($channel['name']) ?>" aria-label="Preview <?= h($channel['name']) ?>"><?= playIcon() ?></button>
+                                <?php endif; ?>
                                 <a class="button small-button icon-button" href="?<?= h(http_build_query($listParams + ['edit' => (int) $channel['id']])) ?>" title="Edit <?= h($channel['name']) ?>" aria-label="Edit <?= h($channel['name']) ?>"><?= editIcon() ?></a>
                                 <?= postButton('delete', (int) $channel['id'], 'Delete ' . $channel['name'], 'small-button danger-button icon-button', deleteIcon()) ?>
                             </div></td>

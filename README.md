@@ -1,26 +1,28 @@
 # IPTV Manager
 
-A self-contained PHP + SQLite web app for managing an IPTV channel library, generating an M3U playlist, importing an XMLTV TV guide, and previewing channels — including DRM-protected ones — directly in the browser.
+A self-contained PHP + SQLite web app for managing an IPTV channel library, generating M3U playlists, importing an XMLTV TV guide, and previewing channels — including DRM-protected ones — directly in the browser.
 
 ![Channel library](docs/screenshots/channels.png)
 
 ## Features
 
 **Channel library**
-- Compact channel table with enable/disable status dot, logo, TVG ID, category, language, type, and URL columns
+- Every channel can have multiple feeds (stream variants), each encrypted or clear
+- Compact channel table with enable/disable status dot, logo, TVG ID, category, language, type, and feed visibility summary
 - Search and category filtering with pagination
-- Add / edit / delete channels manually, or import an existing M3U playlist
+- Add / edit / delete channels and manage their feeds, or import an existing M3U playlist
 - Bulk select and delete channels (select-all on the current page)
 
 **Playlist import**
 - Import channels from an M3U/M3U8 playlist — uploaded as a file or fetched from a URL (gzip supported)
-- Idempotent: channels with the same name and stream URL are updated in place; disabled channels stay disabled
+- Idempotent: entries sharing a channel name become feeds of one channel; re-imports update feeds in place and keep their enable/visibility settings
 - `#KODIPROP` DRM settings (`license_type` / `license_key`, including license request headers) are mapped to the dedicated DRM fields
 - Inline SVG icon actions for play, edit, and delete
 - Category management: rename to merge, delete empty categories
 
 **Playlist feed**
-- Cached M3U feed served on its own port, enabled channels only
+- Cached M3U feed served on its own port; only enabled channels and feeds are included
+- Each feed chooses where it appears: playlist server, clear server, or both
 - Cache is versioned per mutation and validated against the SQLite file signature (`X-Playlist-Cache: HIT|MISS`, ETag / 304 support)
 - Optional `x-tvg-url` header written from the configured guide source
 
@@ -35,13 +37,13 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 - Guide data lives in its own `epg_programs` table and is pruned as it expires
 
 **DRM support**
-- Per-channel DRM type: `None / KODIPROP only`, `ClearKey`, `Widevine`, `PlayReady`
+- Per-feed DRM type: `None / KODIPROP only`, `ClearKey`, `Widevine`, `PlayReady`
 - Dedicated fields for license URL, ClearKey key ID + key, and license request headers
 - Written into the generated playlist as `#KODIPROP:inputstream.adaptive.license_type` and `#KODIPROP:inputstream.adaptive.license_key` (license URL plus header segment for Kodi)
-- Dedicated DRM fields override matching KODIPROP keys; channels configured only through the KODIPROP textarea keep working unchanged
+- Dedicated DRM fields override matching KODIPROP keys; feeds configured only through the KODIPROP textarea keep working unchanged
 
 **Browser preview**
-- Play button on every channel row opens an inline player dialog
+- Play button on every feed (and on each channel row, using its first enabled feed) opens an inline player dialog
 - HLS/DASH streams play through [Shaka Player](https://shaka-player-demo.appspot.com/) (loaded on demand from jsDelivr); MP4/WebM/Ogg use native playback
 - DRM streams configure EME with `clearKeys` or license `servers`, and license request headers are attached through Shaka's networking engine
 
@@ -89,8 +91,8 @@ Three servers are started:
 | Service | Default URL | Purpose |
 |---|---|---|
 | Web UI | `http://127.0.0.1:8000` | Administration interface |
-| Playlist | `http://127.0.0.1:8001` | Cached M3U feed with every channel (`/` only; other paths redirect) |
-| Clear | `http://127.0.0.1:8002` | Cached M3U feed with only channels that have no DRM configured |
+| Playlist | `http://127.0.0.1:8001` | Cached M3U feed with every feed assigned to the playlist server (`/` only; other paths redirect) |
+| Clear | `http://127.0.0.1:8002` | Cached M3U feed with every feed assigned to the clear server |
 
 You can also run the servers directly:
 
@@ -130,19 +132,21 @@ IPTV_HOST=0.0.0.0 IPTV_PORT=8080 IPTV_PLAYLIST_PORT=8081 IPTV_CLEAR_PORT=8082 ./
 
 ### Clear feed
 
-The clear feed exists for players that cannot handle DRM. It serves the same M3U format as the playlist feed, but skips any channel with DRM configured:
+The clear feed exists for players that cannot handle DRM. It serves the same M3U format as the playlist feed, but only includes feeds whose visibility is **clear** or **both**:
 
-- DRM is detected from the dedicated `drm_type`, license URL and ClearKey fields, and from `inputstream.adaptive.license_type` / `inputstream.adaptive.license_key` KODIPROP entries.
-- Channels that pass the filter keep their original `stream_url` and KODIPROP lines — the feed is only a filter, it does not relay or rewrite streams.
-- Detection is configuration-based, so a URL that is encrypted upstream but not marked as DRM in the manager cannot be filtered out.
+- Visibility is per feed and set explicitly: **playlist server only**, **clear server only**, or **both servers**.
+- A feed can be encrypted or clear regardless of where it is assigned; the edit page warns when an encrypted feed is exposed on the clear server.
+- Feeds keep their original `stream_url` and KODIPROP lines — the servers only filter, they do not relay or rewrite streams.
+- A channel with several feeds appears once per feed on a server; the channel name is suffixed with the feed label (or `Feed N`) to keep entries distinguishable.
 
 ## Data and storage
 
 Everything lives in a single SQLite file at `data/iptv.sqlite`. On first run the schema and the seeded `admin` account are created automatically, so a fresh clone starts with an empty channel library that you populate through the UI.
 
 - `data/` is git-ignored (database, cache, logs, PID files) — nothing local is committed
+- Existing single-stream channels are migrated automatically into one feed each; DRM feeds are initially assigned to the playlist server only, clear feeds to both, preserving the previous output
 - Query and playlist caches live in `data/cache/` and are rebuilt automatically
-- Channel edits bump a cache version, so the playlist feed reflects changes immediately
+- Channel and feed edits bump a cache version, so the playlist feed reflects changes immediately
 
 ### Security notes
 
@@ -156,7 +160,7 @@ Everything lives in a single SQLite file at `data/iptv.sqlite`. On first run the
 index.php        Web UI: routes, actions, views, preview player
 lib.php          Schema, migrations, caching, M3U builder, XMLTV importer, DRM helpers, .env loader
 playlist.php     Cached M3U endpoint (ETag / 304), reused for the full and clear feeds
-playlist-clear.php Clear-only M3U endpoint (no DRM-configured channels)
+playlist-clear.php Clear-server M3U endpoint (feeds assigned to clear or both)
 router.php       Per-port routing and style.css cache headers
 style.css        UI styling
 iptv-manager     start / stop / restart / status launcher
