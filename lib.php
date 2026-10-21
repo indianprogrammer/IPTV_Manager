@@ -1615,6 +1615,11 @@ function requestNote(string $note): void
     $GLOBALS['iptv_request_note'] = $note;
 }
 
+function requestVariant(string $variant): void
+{
+    $GLOBALS['iptv_request_variant'] = $variant;
+}
+
 function requestLogIgnored(string $uri): bool
 {
     $path = (string) (parse_url($uri, PHP_URL_PATH) ?? '');
@@ -1668,6 +1673,7 @@ function startRequestLogging(string $service): void
             'status' => is_int($status) && $status > 0 ? $status : 200,
             'ms' => round((microtime(true) - $started) * 1000, 1),
             'note' => $note,
+            'variant' => (string) ($GLOBALS['iptv_request_variant'] ?? ''),
         ]);
     });
 }

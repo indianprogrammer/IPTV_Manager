@@ -26,10 +26,13 @@ if ($decision['rule'] !== null) {
 }
 
 if ($decision['action'] === 'block') {
+    requestVariant('deny');
     header('Cache-Control: no-store');
     http_response_code(404);
     exit;
 }
+
+requestVariant($clearOnly ? 'clear' : 'full');
 
 $playlist = cachedPlaylist($db, $clearOnly);
 $content = $playlist['content'];

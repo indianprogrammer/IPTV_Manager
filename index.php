@@ -505,6 +505,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             saveUserAgentRules($rules);
             flash($replaced ? 'Rule updated.' : 'Rule added.');
+        } elseif ($action === 'ua_rule_allow') {
+            $pattern = mb_substr(trim((string) ($_POST['pattern'] ?? '')), 0, 500);
+            validateUserAgentPattern($pattern);
+            $ruleAction = (string) ($_POST['rule_action'] ?? 'serve');
+            if (!array_key_exists($ruleAction, userAgentRuleActions())) {
+                throw new RuntimeException('Unknown rule action.');
+            }
+            $rules = userAgentRules();
+            $existingIndex = null;
+            foreach ($rules as $index => $existing) {
+                if (strcasecmp((string) $existing['pattern'], $pattern) === 0) {
+                    $existingIndex = $index;
+                    break;
+                }
+            }
+            $rule = [
+                'id' => $existingIndex !== null
+                    ? (string) $rules[$existingIndex]['id']
+                    : bin2hex(random_bytes(6)),
+                'pattern' => $pattern,
+                'action' => $ruleAction,
+                'note' => 'Allowed from the live log',
+                'enabled' => true,
+            ];
+            if ($existingIndex !== null) {
+                unset($rules[$existingIndex]);
+            }
+            array_unshift($rules, $rule);
+            saveUserAgentRules($rules);
+            $served = match ($ruleAction) {
+                'playlist' => 'the full playlist',
+                'clear' => 'the clear playlist',
+                default => 'the default playlist',
+            };
+            flash('User agent allowed — ' . $pattern . ' now gets ' . $served . '.');
         } elseif ($action === 'ua_rule_delete') {
             $ruleId = (string) ($_POST['id'] ?? '');
             $rules = array_values(array_filter(
@@ -533,7 +568,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             throw new RuntimeException('Unknown action.');
         }
-        if (!in_array($action, ['debug_toggle', 'log_clear', 'ua_settings', 'ua_auto_default', 'ua_rule_save', 'ua_rule_delete', 'ua_rule_move'], true)) {
+        if (!in_array($action, ['debug_toggle', 'log_clear', 'ua_settings', 'ua_auto_default', 'ua_rule_save', 'ua_rule_allow', 'ua_rule_delete', 'ua_rule_move'], true)) {
             bumpCacheVersion($db);
         }
     } catch (Throwable $error) {
@@ -764,6 +799,38 @@ function feedDrmWarning(array $feed): string
     return '<p class="feed-warning">This feed has DRM settings but is visible on the clear server.</p>';
 }
 
+function logEntryIsBlocked(array $entry): bool
+{
+    $note = (string) ($entry['note'] ?? '');
+    return $note === 'ua:deny' || str_starts_with($note, 'ua:block');
+}
+
+function logAllowFormHtml(string $userAgent): string
+{
+    $pattern = trim($userAgent);
+    if ($pattern === '') {
+        return '';
+    }
+    $options = '';
+    foreach ([
+        'serve' => 'Default playlist',
+        'playlist' => 'Full playlist',
+        'clear' => 'Clear playlist',
+    ] as $value => $label) {
+        $options .= '<option value="' . h((string) $value) . '">' . h($label) . '</option>';
+    }
+
+    return '<form method="post" action="index.php?log=1" class="inline-form log-allow-form">'
+        . '<input type="hidden" name="csrf" value="' . h(csrfToken()) . '">'
+        . '<input type="hidden" name="action" value="ua_rule_allow">'
+        . '<input type="hidden" name="pattern" value="' . h($pattern) . '">'
+        . '<select name="rule_action" class="small-select" aria-label="Playlist served to this user agent" title="Playlist served to this user agent">'
+        . $options
+        . '</select>'
+        . '<button class="button small-button allow-button" type="submit" title="Allow this user agent">Allow</button>'
+        . '</form>';
+}
+
 function logRowHtml(array $entry): string
 {
     $status = (int) ($entry['status'] ?? 0);
@@ -775,6 +842,17 @@ function logRowHtml(array $entry): string
         ? '<span class="note-chip">' . h($note) . '</span>'
         : '<span class="empty-value">—</span>';
     $detail = h((string) json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $variant = (string) ($entry['variant'] ?? '');
+    $variantHtml = match ($variant) {
+        'full' => '<span class="variant-chip variant-full">Full</span>',
+        'clear' => '<span class="variant-chip variant-clear">Clear</span>',
+        'deny' => '<span class="variant-chip variant-deny">404</span>',
+        default => '<span class="empty-value">—</span>',
+    };
+    $manage = '<button type="button" class="button secondary small-button log-detail-button" data-detail="' . $detail . '">Details</button>';
+    if (logEntryIsBlocked($entry)) {
+        $manage .= logAllowFormHtml((string) ($entry['ua'] ?? ''));
+    }
 
     return '<tr>'
         . '<td class="mono">' . h($timestamp) . '</td>'
@@ -785,7 +863,8 @@ function logRowHtml(array $entry): string
         . '<td class="mono">' . h((string) ($entry['ip'] ?? '')) . '</td>'
         . '<td class="mono ua-cell" title="' . h((string) ($entry['ua'] ?? '')) . '">' . h((string) ($entry['ua'] ?? '')) . '</td>'
         . '<td>' . $noteHtml . '</td>'
-        . '<td><button type="button" class="button secondary small-button log-detail-button" data-detail="' . $detail . '">Details</button></td>'
+        . '<td>' . $variantHtml . '</td>'
+        . '<td class="log-manage">' . $manage . '</td>'
         . '</tr>';
 }
 
@@ -804,6 +883,12 @@ function logDetailFields(array $entry): array
         'Path' => (string) ($entry['uri'] ?? ''),
         'User agent' => (string) ($entry['ua'] ?? ''),
         'Security decision' => (string) ($entry['note'] ?? ''),
+        'Served' => match ((string) ($entry['variant'] ?? '')) {
+            'full' => 'Full playlist',
+            'clear' => 'Clear playlist',
+            'deny' => 'Denied (404 Not Found)',
+            default => '',
+        },
     ];
 }
 
@@ -1538,13 +1623,19 @@ function logDetailFields(array $entry): array
                         <option value="allowed">Allowed (rule matched)</option>
                         <option value="denied">Denied (no rule)</option>
                     </select>
+                    <select id="log-filter-variant" aria-label="Filter by served playlist">
+                        <option value="">All playlists</option>
+                        <option value="full">Full playlist</option>
+                        <option value="clear">Clear playlist</option>
+                        <option value="deny">Denied (404)</option>
+                    </select>
                     <span class="log-filter-count muted" id="log-filter-count"></span>
                     <button class="button secondary small-button" type="button" id="log-filter-clear" hidden>Clear filters</button>
                 </div>
                 <div class="table-wrap">
                     <table class="log-table">
                         <thead>
-                            <tr><th>Time</th><th>Server</th><th>Status</th><th>Method</th><th>Path</th><th>Client IP</th><th>User agent</th><th>Security decision</th><th class="log-detail-head">Detail</th></tr>
+                            <tr><th>Time</th><th>Server</th><th>Status</th><th>Method</th><th>Path</th><th>Client IP</th><th>User agent</th><th>Security decision</th><th>Served</th><th class="log-detail-head">Manage</th></tr>
                         </thead>
                         <tbody id="log-rows">
                             <?php foreach ($logEntries as $entry): ?>
@@ -1604,6 +1695,11 @@ function logDetailFields(array $entry): array
                         ['Path', entry.uri || ''],
                         ['User agent', entry.ua || ''],
                         ['Security decision', entry.note || '—'],
+                        ['Served playlist', ({
+                            full: 'Full playlist',
+                            clear: 'Clear playlist',
+                            deny: 'Denied (404 Not Found)',
+                        })[String(entry.variant || '')] || '—'],
                     ];
                     fields.forEach(([label, value]) => {
                         const dt = document.createElement('dt');
@@ -1657,6 +1753,72 @@ function logDetailFields(array $entry): array
                     return td;
                 };
 
+                const csrf = <?= json_encode(csrfToken()) ?>;
+
+                const isBlocked = (entry) => {
+                    const note = String(entry.note || '');
+                    return note === 'ua:deny' || note.startsWith('ua:block');
+                };
+
+                const variantChip = (variant) => {
+                    const td = document.createElement('td');
+                    const chip = document.createElement('span');
+                    if (variant === 'full') {
+                        chip.className = 'variant-chip variant-full';
+                        chip.textContent = 'Full';
+                    } else if (variant === 'clear') {
+                        chip.className = 'variant-chip variant-clear';
+                        chip.textContent = 'Clear';
+                    } else if (variant === 'deny') {
+                        chip.className = 'variant-chip variant-deny';
+                        chip.textContent = '404';
+                    } else {
+                        chip.className = 'empty-value';
+                        chip.textContent = '—';
+                    }
+                    td.appendChild(chip);
+                    return td;
+                };
+
+                const allowForm = (entry) => {
+                    const pattern = String(entry.ua || '').trim();
+                    if (pattern === '') {
+                        return null;
+                    }
+                    const form = document.createElement('form');
+                    form.method = 'post';
+                    form.action = 'index.php?log=1';
+                    form.className = 'inline-form log-allow-form';
+                    const hidden = (name, value) => {
+                        const input = document.createElement('input');
+                        input.type = 'hidden';
+                        input.name = name;
+                        input.value = value;
+                        form.appendChild(input);
+                    };
+                    hidden('csrf', csrf);
+                    hidden('action', 'ua_rule_allow');
+                    hidden('pattern', pattern);
+                    const select = document.createElement('select');
+                    select.name = 'rule_action';
+                    select.className = 'small-select';
+                    select.title = 'Playlist served to this user agent';
+                    [['serve', 'Default playlist'], ['playlist', 'Full playlist'], ['clear', 'Clear playlist']].forEach(([value, label]) => {
+                        const option = document.createElement('option');
+                        option.value = value;
+                        option.textContent = label;
+                        select.appendChild(option);
+                    });
+                    form.appendChild(select);
+                    const button = document.createElement('button');
+                    button.type = 'submit';
+                    button.className = 'button small-button allow-button';
+                    button.textContent = 'Allow';
+                    button.title = 'Allow this user agent';
+                    form.appendChild(button);
+                    return form;
+                };
+
                 const buildRow = (entry) => {
                     const tr = document.createElement('tr');
                     const time = String(entry.t || '').replace('T', ' ').slice(0, 19);
@@ -1700,13 +1862,22 @@ function logDetailFields(array $entry): array
                         tr.appendChild(cell('—', 'empty-value'));
                     }
 
+                    tr.appendChild(variantChip(String(entry.variant || '')));
+
                     const detailCell = document.createElement('td');
+                    detailCell.className = 'log-manage';
                     const detailButton = document.createElement('button');
                     detailButton.type = 'button';
                     detailButton.className = 'button secondary small-button log-detail-button';
                     detailButton.textContent = 'Details';
                     detailButton.addEventListener('click', () => showDetails(entry));
                     detailCell.appendChild(detailButton);
+                    if (isBlocked(entry)) {
+                        const form = allowForm(entry);
+                        if (form) {
+                            detailCell.appendChild(form);
+                        }
+                    }
                     tr.appendChild(detailCell);
                     return tr;
                 };
@@ -1723,6 +1894,7 @@ function logDetailFields(array $entry): array
                 const filterService = document.getElementById('log-filter-service');
                 const filterStatus = document.getElementById('log-filter-status');
                 const filterSecurity = document.getElementById('log-filter-security');
+                const filterVariant = document.getElementById('log-filter-variant');
                 const filterCount = document.getElementById('log-filter-count');
                 const filterClear = document.getElementById('log-filter-clear');
                 const noMatch = document.getElementById('log-no-match');
@@ -1732,7 +1904,8 @@ function logDetailFields(array $entry): array
                     return (filterText && filterText.value.trim() !== '')
                         || (filterService && filterService.value !== '')
                         || (filterStatus && filterStatus.value !== '')
-                        || (filterSecurity && filterSecurity.value !== '');
+                        || (filterSecurity && filterSecurity.value !== '')
+                        || (filterVariant && filterVariant.value !== '');
                 };
 
                 const matchesFilters = (entry) => {
@@ -1762,6 +1935,11 @@ function logDetailFields(array $entry): array
                             return false;
                         }
                         if (filterSecurity.value === 'denied' && note !== 'ua:deny') {
+                            return false;
+                        }
+                    }
+                    if (filterVariant && filterVariant.value !== '') {
+                        if (String(entry.variant || '') !== filterVariant.value) {
                             return false;
                         }
                     }
@@ -1817,7 +1995,7 @@ function logDetailFields(array $entry): array
                     }
                 };
 
-                [filterText, filterService, filterStatus, filterSecurity].forEach((control) => {
+                [filterText, filterService, filterStatus, filterSecurity, filterVariant].forEach((control) => {
                     if (control) {
                         control.addEventListener('input', applyFilters);
                         control.addEventListener('change', applyFilters);
@@ -1829,6 +2007,7 @@ function logDetailFields(array $entry): array
                         if (filterService) filterService.value = '';
                         if (filterStatus) filterStatus.value = '';
                         if (filterSecurity) filterSecurity.value = '';
+                        if (filterVariant) filterVariant.value = '';
                         applyFilters();
                     });
                 }

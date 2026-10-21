@@ -49,8 +49,10 @@ A self-contained PHP + SQLite web app for managing an IPTV channel library, gene
 
 **Live log (debug mode)**
 - Toggle debug mode from the **Live log** page; while on, every request to the web, playlist, clear and auto servers is recorded
-- One JSON line per request in `data/requests.log` — timestamp, server, client IP, user agent, method, path, status, duration, and any user-agent security decision
+- One JSON line per request in `data/requests.log` — timestamp, server, client IP, user agent, method, path, status, duration, the security decision and the playlist that was served (`full`, `clear` or `deny`)
 - The page polls the log every two seconds and renders new lines live; the file auto-rotates at 1 MB (last 400 lines kept)
+- Filters for text, server, status, security decision and **served playlist** (full / clear / denied)
+- A blocked request gets an **Allow** button right in the log row: pick the playlist the client should receive (default, full or clear) and the matching rule is created — or an existing block rule is rewritten and moved to the top
 
 **User-agent security**
 - **Deny by default**: with enforcement on, the playlist, clear and auto feeds return **404 Not Found** to every client unless its `User-Agent` matches an allow rule
